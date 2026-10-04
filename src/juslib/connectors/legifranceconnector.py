@@ -14,12 +14,19 @@ Documentation : https://piste.gouv.fr/
 
 ⚠️  Légifrance API PISTE nécessite une clé API OAuth2 (client_credentials).
      Clé à configurer dans .env : LEGIFRANCE_CLIENT_ID + LEGIFRANCE_CLIENT_SECRET
+     LEGIFRANCE_PISTE_ENV=sandbox|production (défaut : sandbox pour tests)
      Accès gratuit : https://developer.aife.economie.gouv.fr/
+
+R002-P0-05 : Correction URL OAuth.
+  Sandbox  → oauth.sandbox-aife.economie.gouv.fr (tests)
+  Production → oauth.aife.economie.gouv.fr        (prod)
+  Les deux environnements utilisent des credentials séparés.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -30,9 +37,18 @@ from .base_connector import BaseConnector, ConnectorResult
 
 logger = logging.getLogger("juslib.connector.legifrance")
 
-# Endpoint PISTE OAuth2 + API
-PISTE_TOKEN_URL = "https://sandbox-oauth.piste.gouv.fr/api/oauth/token"
-PISTE_API_BASE = "https://api.piste.gouv.fr/dila/legifrance/lf-engine-app"
+# R002-P0-05 : URLs séparées sandbox / production
+# Source : https://developer.aife.economie.gouv.fr/index.php?option=com_apiportal
+_PISTE_ENVS = {
+    "sandbox": {
+        "token_url": "https://oauth.sandbox-aife.economie.gouv.fr/api/oauth/token",
+        "api_base": "https://sandbox-api.piste.gouv.fr/dila/legifrance/lf-engine-app",
+    },
+    "production": {
+        "token_url": "https://oauth.aife.economie.gouv.fr/api/oauth/token",
+        "api_base": "https://api.piste.gouv.fr/dila/legifrance/lf-engine-app",
+    },
+}
 
 # Mapping types Légifrance → DocumentType JUSLIB
 LEGIFRANCE_NATURE_MAP = {
@@ -68,7 +84,7 @@ class LegifranceConnector(BaseConnector):
     """
 
     CONNECTOR_ID = "legifrance"
-    CONNECTOR_VERSION = "0.1.0"
+    CONNECTOR_VERSION = "0.1.1"  # R002-P0-05
     SOURCE_NAME = "Légifrance — Service public de la diffusion du droit"
     SOURCE_JURISDICTION = "FR"
     BASE_URL = "https://www.legifrance.gouv.fr"
@@ -77,12 +93,26 @@ class LegifranceConnector(BaseConnector):
         self,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
+        piste_env: Optional[str] = None,
         debug: bool = True,
     ):
         super().__init__(debug=debug)
         self.client_id = client_id
         self.client_secret = client_secret
         self._access_token: Optional[str] = None
+
+        # R002-P0-05 : sélection automatique sandbox / production
+        env = (piste_env or os.getenv("LEGIFRANCE_PISTE_ENV", "sandbox")).lower()
+        if env not in _PISTE_ENVS:
+            self._log.warning(
+                "[LEGIFRANCE] LEGIFRANCE_PISTE_ENV='%s' invalide — fallback 'sandbox'", env
+            )
+            env = "sandbox"
+        self._piste_env = env
+        self._token_url = _PISTE_ENVS[env]["token_url"]
+        self._api_base = _PISTE_ENVS[env]["api_base"]
+        self._log.debug("[LEGIFRANCE] env=%s token_url=%s", env, self._token_url)
+
         if not client_id or not client_secret:
             self._log.warning(
                 "[LEGIFRANCE] LEGIFRANCE_CLIENT_ID / CLIENT_SECRET non configurés — "
@@ -91,7 +121,7 @@ class LegifranceConnector(BaseConnector):
             )
 
     def _get_token(self) -> Optional[str]:
-        """Authentification OAuth2 client_credentials sur PISTE."""
+        """Authentification OAuth2 client_credentials sur PISTE (sandbox ou production)."""
         if not self.client_id or not self.client_secret:
             self._log.error("[LEGIFRANCE] Clé API manquante — impossible d'obtenir un token")
             return None
@@ -103,7 +133,7 @@ class LegifranceConnector(BaseConnector):
         }).encode("utf-8")
         try:
             req = urllib.request.Request(
-                PISTE_TOKEN_URL,
+                self._token_url,  # R002-P0-05 : URL dynamique sandbox/production
                 data=data,
                 method="POST",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -128,14 +158,18 @@ class LegifranceConnector(BaseConnector):
 
         token = self._access_token or self._get_token()
         if not token:
-            url = f"{PISTE_API_BASE}/consult/getTexte"
+            url = f"{self._api_base}/consult/getTexte"
             return self._make_result(
                 success=False,
                 source_url=url,
-                error_message="Token OAuth2 non disponible — LEGIFRANCE_CLIENT_ID/SECRET requis",
+                error_message=(
+                    f"Token OAuth2 non disponible [{self._piste_env}] — "
+                    "LEGIFRANCE_CLIENT_ID/SECRET requis. "
+                    "Accès gratuit : https://developer.aife.economie.gouv.fr/"
+                ),
             )
 
-        url = f"{PISTE_API_BASE}/consult/getTexte"
+        url = f"{self._api_base}/consult/getTexte"
         payload = json.dumps({"textId": identifier}).encode("utf-8")
         self._log.debug("[LEGIFRANCE] fetch id=%s", identifier)
 
@@ -176,11 +210,11 @@ class LegifranceConnector(BaseConnector):
         if not token:
             return [self._make_result(
                 success=False,
-                source_url=f"{PISTE_API_BASE}/search",
-                error_message="Token OAuth2 requis — configurer LEGIFRANCE_CLIENT_ID/SECRET",
+                source_url=f"{self._api_base}/search",
+                error_message=f"Token OAuth2 requis [{self._piste_env}] — configurer LEGIFRANCE_CLIENT_ID/SECRET",
             )]
 
-        url = f"{PISTE_API_BASE}/search"
+        url = f"{self._api_base}/search"
         payload = json.dumps({
             "recherche": {
                 "champs": [{"typeChamp": "ALL", "criteres": [{"typeRecherche": "EGAL", "valeur": query}]}],

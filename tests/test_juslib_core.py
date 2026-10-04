@@ -2,14 +2,19 @@
 JUSLIB — Test suite complète.
 
 Tests couvrant les 6 invariants fondamentaux JUSLIB + modèles + connecteurs + versionnement.
+Inclut les corrections R002 (audit v0.1.0) — V0.1.1.
 
 Invariants testés :
-  INV-1 : source_url + source_hash obligatoires
+  INV-1 : source_url + source_hash obligatoires (hash réel, pas fictif)
   INV-2 : INSERT-only (versions immuables)
   INV-3 : explication reliée à son source (FK non nullable)
   INV-4 : traçabilité corpus (hash + release)
-  INV-5 : marquage production_type + ai_warning
+  INV-5 : marquage production_type + ai_warning (RULE_BASED vs LLM_GENERATED)
   INV-6 : certainty_level explicite
+
+Tests R002 ajoutés :
+  F — LegalVersion (hiérarchie temporelle)
+  G — Corrections P0 (faux AI_GENERATED, confidence, versionnement, CanLII classification)
 
 Exécution : cd juslib && pytest tests/ -v
 """
@@ -323,7 +328,8 @@ class TestModels:
             publication_date=date(2016, 5, 4),
             entry_into_force=date(2018, 5, 25),
             source_url="https://eur-lex.europa.eu/legal-content/FR/TXT/?uri=CELEX:32016R0679",
-            source_hash="abc123def456",
+            # R002 : hash réel calculé sur le titre — pas de valeur fictive
+            source_hash=hashlib.sha256(b"Reglement general sur la protection des donnees").hexdigest(),
             production_type=ProductionType.SOURCE,
             certainty_level=CertaintyLevel.CERTAIN,
             legal_domains=["protection_donnees", "droit_numerique", "droit_UE"],
@@ -604,3 +610,221 @@ class TestConnectors:
         meta = c.get_metadata("32016R0679")
         assert meta["celex"] == "32016R0679"
         assert "fr" in meta["available_languages"]
+
+
+# ============================================================
+# BLOC F — LegalVersion (R002-P0-02)
+# ============================================================
+
+class TestLegalVersion:
+    """Tests du modèle LegalVersion (hiérarchie temporelle R002-P0-02)."""
+
+    def test_F01_legal_version_canonical_hash(self):
+        from juslib.models.legal_version import LegalVersion
+        v = LegalVersion(
+            provision_id="PROV-001",
+            document_id="DOC-001",
+            text="La personne concernée a le droit d'obtenir l'effacement des données.",
+            language="fr",
+            valid_from=date(2018, 5, 25),
+            source_url="https://eur-lex.europa.eu",
+            raw_source_hash=hashlib.sha256(b"raw source bytes").hexdigest(),
+        )
+        h = v.compute_canonical_hash()
+        assert h is not None
+        assert len(h) == 64
+        assert v.canonical_content_hash == h
+
+    def test_F02_legal_version_hash_deterministic(self):
+        from juslib.models.legal_version import LegalVersion
+        text = "Article 17 : effacement des données."
+        v1 = LegalVersion(provision_id="P", document_id="D", text=text)
+        v2 = LegalVersion(provision_id="P", document_id="D", text=text)
+        assert v1.compute_canonical_hash() == v2.compute_canonical_hash()
+
+    def test_F03_legal_version_hash_differs_on_text_change(self):
+        from juslib.models.legal_version import LegalVersion
+        v1 = LegalVersion(provision_id="P", document_id="D", text="Texte original.")
+        v2 = LegalVersion(provision_id="P", document_id="D", text="Texte modifié.")
+        assert v1.compute_canonical_hash() != v2.compute_canonical_hash()
+
+    def test_F04_legal_version_integrity_check_passes(self):
+        from juslib.models.legal_version import LegalVersion
+        v = LegalVersion(
+            provision_id="PROV-001",
+            document_id="DOC-001",
+            text="Texte juridique test.",
+            raw_source_hash=hashlib.sha256(b"brut").hexdigest(),
+        )
+        v.compute_canonical_hash()  # calcule et stocke
+        ok, errors = v.verify_integrity()
+        assert ok, f"Intégrité échouée: {errors}"
+
+    def test_F05_legal_version_integrity_fails_on_tamper(self):
+        from juslib.models.legal_version import LegalVersion
+        v = LegalVersion(provision_id="P", document_id="D", text="Original.")
+        v.canonical_content_hash = "hash_falsifie_0000000000000000000000000000000"
+        ok, errors = v.verify_integrity()
+        assert not ok
+        assert any("R002-P0-03" in e for e in errors)
+
+    def test_F06_legal_version_in_force_check(self):
+        from juslib.models.legal_version import LegalVersion
+        v = LegalVersion(
+            provision_id="P", document_id="D", text="T.",
+            valid_from=date(2018, 5, 25),
+            valid_until=date(2024, 1, 1),
+        )
+        assert v.is_in_force(date(2020, 6, 1)) is True
+        assert v.is_in_force(date(2024, 1, 1)) is False  # valid_until exclusif
+        assert v.is_in_force(date(2015, 1, 1)) is False  # avant valid_from
+
+    def test_F07_legal_version_validate_missing_provision_id(self):
+        from juslib.models.legal_version import LegalVersion
+        v = LegalVersion(
+            provision_id="",  # MANQUANT
+            document_id="D",
+            text="T.",
+            valid_from=date(2018, 5, 25),
+            source_url="https://eur-lex.europa.eu",
+            raw_source_hash="abc",
+        )
+        v.compute_canonical_hash()
+        ok, errors = v.validate()
+        assert not ok
+        assert any("provision_id" in e for e in errors)
+
+    def test_F08_legal_provision_validate(self):
+        from juslib.models.legal_version import LegalProvision
+        prov = LegalProvision(
+            document_id="JUSLIB-DOC-001",
+            number="17",
+            label="Article 17",
+        )
+        ok, errors = prov.validate()
+        assert ok, errors
+
+    def test_F09_legal_provision_orphan_fails(self):
+        from juslib.models.legal_version import LegalProvision
+        prov = LegalProvision(document_id="", number="17")
+        ok, errors = prov.validate()
+        assert not ok
+
+
+# ============================================================
+# BLOC G — Tests corrections R002
+# ============================================================
+
+class TestR002Corrections:
+    """Tests validant les corrections P0 de l'audit R002."""
+
+    def test_G01_production_type_rule_based_distinct_from_llm(self):
+        """R002-P0-04 : RULE_BASED et LLM_GENERATED sont des types distincts."""
+        from juslib.models.legal_document import ProductionType
+        assert ProductionType.RULE_BASED != ProductionType.LLM_GENERATED
+        assert ProductionType.RULE_BASED.value == "rule_based"
+        assert ProductionType.LLM_GENERATED.value == "llm_generated"
+
+    def test_G02_no_llm_generated_without_api_key(self, monkeypatch):
+        """R002-P0-04 : sans BOB_API_KEY, le moteur reste RULE_BASED (pas de faux LLM_GENERATED)."""
+        monkeypatch.delenv("BOB_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        engine = PlainLanguageEngine(llm_enabled=True)
+        result = engine.explain("ID-001", "disposition",
+                                "Test texte juridique.", ReadingLevel.CITIZEN)
+        assert result.production_type == "rule_based", (
+            f"Sans clé API, production_type doit être rule_based, obtenu: {result.production_type}"
+        )
+
+    def test_G03_legifrance_sandbox_url(self):
+        """R002-P0-05 : URL OAuth sandbox correcte."""
+        from juslib.connectors.legifranceconnector import LegifranceConnector, _PISTE_ENVS
+        c = LegifranceConnector(piste_env="sandbox")
+        assert c._piste_env == "sandbox"
+        assert "sandbox" in c._token_url
+        assert c._token_url == _PISTE_ENVS["sandbox"]["token_url"]
+
+    def test_G04_legifrance_production_url_distinct(self):
+        """R002-P0-05 : URL OAuth production ≠ sandbox."""
+        from juslib.connectors.legifranceconnector import _PISTE_ENVS
+        assert _PISTE_ENVS["sandbox"]["token_url"] != _PISTE_ENVS["production"]["token_url"]
+        assert _PISTE_ENVS["sandbox"]["api_base"] != _PISTE_ENVS["production"]["api_base"]
+        assert "sandbox" not in _PISTE_ENVS["production"]["token_url"]
+
+    def test_G05_canlii_classified_as_secondary(self):
+        """R002-P0-06 : CanLII classifié SOURCE_SECONDAIRE (pas source normative)."""
+        from juslib.connectors.canlii_connector import CanLIIConnector
+        c = CanLIIConnector()
+        assert hasattr(c, "SOURCE_CLASSIFICATION")
+        assert c.SOURCE_CLASSIFICATION == "SECONDARY_AGGREGATOR"
+
+    def test_G06_ohada_uses_institutional_url(self):
+        """R002-P0-07 : OHADA utilise ohada.org (institutionnel, pas ohada.com)."""
+        from juslib.connectors.ohada_connector import OHADA_BASE_URL, OHADA_ACTES_BASE
+        assert "ohada.org" in OHADA_BASE_URL
+        assert "ohada.com" not in OHADA_BASE_URL
+        assert "ohada.org" in OHADA_ACTES_BASE
+
+    def test_G07_version_label_uses_max_plus_one(self, tmp_path):
+        """R002-P0-08 : versionnement utilise max(existant)+1, pas count+1."""
+        tracker = CorpusTracker(corpus_dir=str(tmp_path))
+        today = datetime.utcnow().strftime("%Y.%m.%d")
+        # Séquence avec un trou : 001, 003 → prochain doit être 004
+        existing = [f"{today}-001", f"{today}-003"]
+        label = tracker.generate_version_label(existing)
+        assert label == f"{today}-004", f"Attendu {today}-004, obtenu {label}"
+
+    def test_G08_changelog_uuid_suffix_no_collision(self, tmp_path):
+        """R002-P0-08 : deux sauvegardes simultanées → suffixes UUID4 distincts."""
+        ChangelogBuilder.CHANGELOGS_DIR = str(tmp_path)
+        b1 = ChangelogBuilder("2026.10.04-001")
+        b2 = ChangelogBuilder("2026.10.04-001")
+        path1 = b1.save(str(tmp_path / "2026.10.04-001.json"))
+        path2 = b2.save(str(tmp_path / "2026.10.04-001.json"))
+        assert path1 != path2, "Les deux sauvegardes doivent avoir des chemins distincts"
+
+    def test_G09_relation_default_confidence_zero(self):
+        """R002-P0-09 : confidence par défaut = 0.0 (pas 1.0)."""
+        rel = LegalRelation(
+            source_id="A",
+            source_type="document",
+            target_id="B",
+            target_type="document",
+            relation_type=RelationType.REFERS_TO,
+        )
+        assert rel.confidence == 0.0, (
+            f"confidence doit être 0.0 par défaut, obtenu: {rel.confidence}"
+        )
+
+    def test_G10_relation_explicit_confidence_valid(self):
+        """Une relation officielle peut avoir confidence=1.0 si explicitement établie."""
+        rel = LegalRelation(
+            source_id="RGPD",
+            source_type="document",
+            target_id="DIR-95-46",
+            target_type="document",
+            relation_type=RelationType.SUPERSEDES,
+            confidence=1.0,
+            legal_basis="RGPD art. 94 §1 : 'La directive 95/46/CE est abrogée'",
+        )
+        ok, errors = rel.validate()
+        assert ok, errors
+        assert rel.confidence == 1.0
+
+    def test_G11_raw_hash_and_canonical_hash_are_distinct_fields(self):
+        """R002-P0-03 : raw_source_hash et canonical_content_hash sont deux champs séparés."""
+        from juslib.models.legal_version import LegalVersion
+        raw = hashlib.sha256(b"contenu brut HTML").hexdigest()
+        v = LegalVersion(
+            provision_id="P", document_id="D",
+            text="Texte normalisé sans balises HTML.",
+            raw_source_hash=raw,
+        )
+        v.compute_canonical_hash()
+        # Les deux hashes doivent coexister et être différents
+        assert v.raw_source_hash is not None
+        assert v.canonical_content_hash is not None
+        assert v.raw_source_hash != v.canonical_content_hash, (
+            "raw_source_hash et canonical_content_hash ne doivent pas être identiques "
+            "(le contenu brut diffère du texte normalisé)"
+        )

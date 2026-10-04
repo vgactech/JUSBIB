@@ -47,11 +47,22 @@ class DocumentType(str, Enum):
 
 
 class ProductionType(str, Enum):
-    """Origine de la production — jamais effaçable pour l'audit."""
-    SOURCE = "source"                    # Texte officiel (domaine public ou open data)
+    """
+    Origine de la production — jamais effaçable pour l'audit.
+
+    R002-P0-04 : séparation stricte RULE_BASED / LLM_GENERATED / SOURCE.
+    AI_GENERATED ne doit jamais être utilisé sans appel LLM réel.
+    """
+    SOURCE = "source"                    # Texte officiel authentifié (domaine public ou open data)
     ANALYSIS = "analysis"                # Analyse humaine validée
-    AI_GENERATED = "ai_generated"        # Produit par IA — NON VALIDÉ
-    AI_VALIDATED = "ai_validated"        # Produit par IA + validé par juriste humain
+    RULE_BASED = "rule_based"            # Traitement algorithmique local (glossaire, règles)
+    LLM_GENERATED = "llm_generated"     # Produit par un LLM réel (modèle + version enregistrés)
+    LLM_VALIDATED = "llm_validated"     # Produit par LLM + validé par juriste humain
+    HUMAN_AUTHORED = "human_authored"   # Rédigé directement par un juriste humain
+    HUMAN_VALIDATED = "human_validated" # Toute origine + validation humaine formelle
+    # Legacy — conservé pour compatibilité ascendante V0.1.0 uniquement
+    AI_GENERATED = "ai_generated"        # DÉPRÉCIÉ — utiliser LLM_GENERATED + modèle explicite
+    AI_VALIDATED = "ai_validated"        # DÉPRÉCIÉ — utiliser LLM_VALIDATED
 
 
 class CertaintyLevel(str, Enum):

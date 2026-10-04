@@ -6,6 +6,7 @@ from .relation import LegalRelation, RelationType
 from .citation import Citation
 from .provenance import Provenance
 from .corpus_version import CorpusVersion
+from .legal_version import LegalVersion, LegalProvision, VersionChangeType
 
 __all__ = [
     "LegalDocument", "DocumentType", "ProductionType", "CertaintyLevel",
@@ -15,4 +16,5 @@ __all__ = [
     "Citation",
     "Provenance",
     "CorpusVersion",
+    "LegalVersion", "LegalProvision", "VersionChangeType",
 ]

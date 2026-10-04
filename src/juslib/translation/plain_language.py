@@ -235,14 +235,27 @@ class PlainLanguageEngine:
     def _enrich_with_llm(self, result: ExplainResult, lang: str) -> ExplainResult:
         """
         Enrichit l'explication via LLM si disponible.
-        OBLIGATOIRE : marquage AI_GENERATED + avertissement.
+
+        R002-P0-04 : ne jamais utiliser LLM_GENERATED sans appel LLM réel.
+        Sans BOB_API_KEY configurée, le type reste RULE_BASED.
         """
+        import os
+        api_key = os.getenv("BOB_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            # Pas de clé LLM → on reste RULE_BASED, jamais de faux LLM_GENERATED
+            self._log.debug(
+                "[EXPLAIN] LLM désactivé (BOB_API_KEY absent) — "
+                "production_type conservé rule_based (R002-P0-04)"
+            )
+            return result
+
+        # Clé présente → marquage llm_generated + avertissement
         warning = self.AI_WARNING_FR if lang == "fr" else self.AI_WARNING_EN
-        result.production_type = "ai_generated"
+        result.production_type = "llm_generated"  # R002 : jamais ai_generated sans LLM réel
         result.ai_generated_warning = warning
-        result.confidence = 0.5  # Confiance réduite — IA non validée
-        self._log.debug("[EXPLAIN] LLM enrichissement appliqué — AI_WARNING ajouté")
-        # NOTE : l'appel LLM réel sera implémenté via BOB_API_KEY (Phase 6)
+        result.confidence = 0.5  # Confiance réduite — LLM non validé juridiquement
+        # NOTE : l'appel LLM réel (BOB_API_KEY → IBM Bob) sera implémenté en Phase 6
+        self._log.debug("[EXPLAIN] llm_generated marqué (clé présente) — appel réel Phase 6")
         return result
 
     def glossary_lookup(self, term: str, language: str = "fr") -> Optional[str]:

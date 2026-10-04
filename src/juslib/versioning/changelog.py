@@ -144,17 +144,21 @@ class ChangelogBuilder:
     def save(self, path: Optional[str] = None) -> str:
         """
         Sauvegarde le changelog (JSON + Markdown).
-        Invariant : jamais d'écrasement — si le fichier existe, append une version.
+        Invariant : jamais d'écrasement — si le fichier existe, suffixe UUID4 (R002-P0-08).
+
+        R002-P0-08 : le suffixe horodaté à la seconde pouvait collisionner.
+        Remplacement par UUID4 (128 bits d'entropie — collision pratiquement impossible).
         """
+        import uuid as _uuid
         target_dir = self.CHANGELOGS_DIR
         json_path = path or os.path.join(target_dir, f"{self.version_label}.json")
         md_path = json_path.replace(".json", ".md")
 
-        # Jamais d'écrasement
+        # Jamais d'écrasement — suffixe UUID4 si collision (R002-P0-08)
         if os.path.exists(json_path):
-            timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-            json_path = json_path.replace(".json", f"_{timestamp}.json")
-            md_path = md_path.replace(".md", f"_{timestamp}.md")
+            uid = _uuid.uuid4().hex[:12]
+            json_path = json_path.replace(".json", f"_{uid}.json")
+            md_path = md_path.replace(".md", f"_{uid}.md")
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)

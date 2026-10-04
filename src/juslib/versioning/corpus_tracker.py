@@ -77,13 +77,27 @@ class CorpusTracker:
     def generate_version_label(self, existing_labels: list[str]) -> str:
         """
         Génère le prochain label de version pour la date courante.
-        Format : YYYY.MM.DD-NNN (incrémente NNN si même date).
+        Format : YYYY.MM.DD-NNN.
+
+        R002-P0-08 : utilise max(révision existante) + 1 au lieu de count + 1.
+        Exemple : séquence [001, 003] → prochain = 004 (pas 003 de nouveau).
         """
         today = datetime.utcnow().strftime("%Y.%m.%d")
         same_day = [l for l in existing_labels if l.startswith(today)]
-        rev = len(same_day) + 1
-        label = f"{today}-{rev:03d}"
-        self._log.debug("[CORPUS] generated label: %s", label)
+        if same_day:
+            # Extraire les numéros de révision existants et prendre le max
+            revisions = []
+            for lbl in same_day:
+                try:
+                    rev_part = lbl.rsplit("-", 1)[-1]
+                    revisions.append(int(rev_part))
+                except (ValueError, IndexError):
+                    pass
+            next_rev = (max(revisions) + 1) if revisions else 1
+        else:
+            next_rev = 1
+        label = f"{today}-{next_rev:03d}"
+        self._log.debug("[CORPUS] generated label: %s (max_rev=%s)", label, next_rev - 1)
         return label
 
     def prepare_release(

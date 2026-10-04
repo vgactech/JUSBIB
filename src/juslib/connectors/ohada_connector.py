@@ -24,8 +24,13 @@ from .base_connector import BaseConnector, ConnectorResult
 
 logger = logging.getLogger("juslib.connector.ohada")
 
-OHADA_BASE_URL = "https://www.ohada.com"
-OHADA_ACTES_BASE = "https://www.ohada.com/actes-uniformes"
+# R002-P0-07 : URL institutionnelle correcte (ohada.org, pas ohada.com)
+# Source : https://www.ohada.org/actes-uniformes/
+# ohada.org = site officiel de l'OHADA institutionnel (Organisation)
+# ohada.com = site tiers non institutionnel
+OHADA_BASE_URL = "https://www.ohada.org"
+OHADA_ACTES_BASE = "https://www.ohada.org/actes-uniformes"
+OHADA_JO_BASE = "https://www.ohada.org/journal-officiel"  # Journal Officiel OHADA
 
 
 class OHADAConnector(BaseConnector):
@@ -40,9 +45,11 @@ class OHADAConnector(BaseConnector):
     """
 
     CONNECTOR_ID = "ohada"
-    CONNECTOR_VERSION = "0.1.0"
+    CONNECTOR_VERSION = "0.1.1"  # R002-P0-07 : URL corrigée → ohada.org institutionnel
     SOURCE_NAME = "OHADA — Organisation pour l'Harmonisation en Afrique du Droit des Affaires"
     SOURCE_JURISDICTION = "OHADA"
+    # R002-P0-07 : source institutionnelle (17 États membres)
+    # Ref : https://www.ohada.org/presentation-generale/
     BASE_URL = OHADA_BASE_URL
     SUPPORTED_LANGUAGES = ["fr"]
 

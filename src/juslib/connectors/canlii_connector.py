@@ -1,11 +1,17 @@
 """
 JUSLIB — CanLII connector (Canada / Québec).
 
-Source : CanLII API — Canadian Legal Information Institute
-Couverture :
-  - Jurisprudence canadienne fédérale et provinciale
-  - LégisQuébec, Lois du Canada
-  - Bilinguisme : français + anglais
+CLASSIFICATION R002-P0-06 : SOURCE SECONDAIRE (agrégateur juridique de haute qualité).
+CanLII n'est PAS une source normative officielle.
+CanLII indique que ses copies ne sont pas nécessairement dotées d'une valeur officielle.
+Ref : https://www.canlii.org/databases + https://www.canlii.org/info/terms.html
+
+Sources officielles canadiennes :
+  Lois du Canada      : https://laws-lois.justice.gc.ca/
+  LégisQuébec (QC)    : https://www.legisquebec.gouv.qc.ca/
+
+Les documents récupérés via CanLII sont marqués source_classification=SECONDARY_AGGREGATOR.
+Ne jamais présenter un document CanLII comme source normative officielle.
 
 API officielle : https://api.canlii.org/
 Documentation : https://law.canlii.org/
@@ -41,9 +47,11 @@ class CanLIIConnector(BaseConnector):
     """
 
     CONNECTOR_ID = "canlii"
-    CONNECTOR_VERSION = "0.1.0"
+    CONNECTOR_VERSION = "0.1.1"  # R002-P0-06
     SOURCE_NAME = "CanLII — Institut canadien d'information juridique"
     SOURCE_JURISDICTION = "CA"
+    # R002-P0-06 : CanLII = SOURCE SECONDAIRE (agrégateur) — pas source normative officielle
+    SOURCE_CLASSIFICATION = "SECONDARY_AGGREGATOR"
     BASE_URL = "https://www.canlii.org"
 
     SUPPORTED_LANGUAGES = ["fr", "en"]

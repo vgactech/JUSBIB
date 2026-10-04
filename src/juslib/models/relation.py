@@ -82,7 +82,13 @@ class LegalRelation:
     # --- Contexte ---
     description: Optional[str] = None          # Description libre de la relation
     legal_basis: Optional[str] = None          # Fondement juridique de la relation
-    confidence: float = 1.0                    # 0.0→1.0 (1.0 = relation officielle établie)
+    # R002-P0-09 : défaut 0.0 (pas 1.0) — une relation auto-créée n'est jamais certaine
+    # Valeurs recommandées :
+    #   1.0 = relation officielle explicite dans le texte (ex: "abroge l'article X")
+    #   0.8 = relation établie par doctrine ou jurisprudence constante
+    #   0.5 = relation probable mais non confirmée
+    #   0.0 = relation non vérifiée / extraite automatiquement
+    confidence: float = 0.0                    # 0.0→1.0 (0.0 = non vérifiée par défaut)
     is_contested: bool = False                 # La relation est-elle contestée ?
 
     # --- Validité temporelle ---
