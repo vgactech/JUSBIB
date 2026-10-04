@@ -89,8 +89,9 @@ class LegalVersion:
 
     def compute_canonical_hash(self) -> str:
         """
-        Calcule le canonical_content_hash.
-        Normalisation : strip, lower, collapse whitespace, NFC unicode.
+        Calcule et STOCKE le canonical_content_hash depuis self.text.
+        Normalisation : NFC unicode + collapse whitespace + strip.
+        À appeler UNIQUEMENT lors de la création initiale de la version.
         """
         import unicodedata
         import re
@@ -100,23 +101,41 @@ class LegalVersion:
         self.canonical_content_hash = h
         return h
 
+    def _compute_hash_readonly(self) -> str:
+        """
+        Calcule le hash canonique du texte courant SANS modifier self.canonical_content_hash.
+        Utilisé par verify_integrity() pour comparer sans effet de bord.
+
+        R003-P0-B : fix du bug critique — compute_canonical_hash() écrasait
+        self.canonical_content_hash avant la comparaison, garantissant un faux succès.
+        """
+        import unicodedata
+        import re
+        normalized = unicodedata.normalize("NFC", self.text)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
     def verify_integrity(self) -> tuple[bool, list[str]]:
         """
-        Vérifie la cohérence des hashes.
-        canonical_content_hash doit correspondre au texte actuel.
+        Vérifie la cohérence des hashes SANS modifier l'état de l'objet.
+
+        R003-P0-B : utilise _compute_hash_readonly() au lieu de compute_canonical_hash()
+        pour éviter l'écrasement du hash stocké avant comparaison.
+        Le hash stocké est lu en lecture seule — toute divergence est une erreur réelle.
         """
         errors: list[str] = []
         if not self.raw_source_hash:
-            errors.append("R002-P0-03: raw_source_hash manquant")
+            errors.append("R003-P0-B: raw_source_hash manquant")
         if not self.canonical_content_hash:
-            errors.append("R002-P0-03: canonical_content_hash manquant")
+            errors.append("R003-P0-B: canonical_content_hash manquant")
         else:
-            expected = self.compute_canonical_hash()
-            if expected != self.canonical_content_hash:
+            stored = self.canonical_content_hash  # lecture seule
+            computed = self._compute_hash_readonly()  # jamais stocké ici
+            if computed != stored:
                 errors.append(
-                    f"R002-P0-03: canonical_content_hash incohérent — "
-                    f"stocké={self.canonical_content_hash[:12]}… "
-                    f"calculé={expected[:12]}…"
+                    f"R003-P0-B: canonical_content_hash incohérent — "
+                    f"stocké={stored[:12]}… "
+                    f"calculé={computed[:12]}…"
                 )
         return len(errors) == 0, errors
 

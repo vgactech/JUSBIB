@@ -236,27 +236,29 @@ class PlainLanguageEngine:
         """
         Enrichit l'explication via LLM si disponible.
 
-        R002-P0-04 : ne jamais utiliser LLM_GENERATED sans appel LLM réel.
-        Sans BOB_API_KEY configurée, le type reste RULE_BASED.
+        R003-P0-D : ne JAMAIS marquer production_type="llm_generated" sans appel LLM réel.
+        Même si BOB_API_KEY est présente, la présence de la clé n'est pas un appel.
+        Sans appel LLM effectif retournant un texte enrichi, le type reste "rule_based".
+        L'appel réel (BOB_API_KEY → IBM Bob CLI) sera implémenté en Phase 6.
+        Jusqu'à Phase 6 : cette méthode retourne l'entrée inchangée, sans effet de bord.
         """
         import os
         api_key = os.getenv("BOB_API_KEY") or os.getenv("OPENROUTER_API_KEY")
         if not api_key:
-            # Pas de clé LLM → on reste RULE_BASED, jamais de faux LLM_GENERATED
             self._log.debug(
                 "[EXPLAIN] LLM désactivé (BOB_API_KEY absent) — "
-                "production_type conservé rule_based (R002-P0-04)"
+                "production_type conservé rule_based (R003-P0-D)"
             )
             return result
 
-        # Clé présente → marquage llm_generated + avertissement
-        warning = self.AI_WARNING_FR if lang == "fr" else self.AI_WARNING_EN
-        result.production_type = "llm_generated"  # R002 : jamais ai_generated sans LLM réel
-        result.ai_generated_warning = warning
-        result.confidence = 0.5  # Confiance réduite — LLM non validé juridiquement
-        # NOTE : l'appel LLM réel (BOB_API_KEY → IBM Bob) sera implémenté en Phase 6
-        self._log.debug("[EXPLAIN] llm_generated marqué (clé présente) — appel réel Phase 6")
-        return result
+        # Clé présente MAIS appel LLM réel non encore implémenté (Phase 6).
+        # R003-P0-D : NE PAS marquer llm_generated sans appel réel — retourner rule_based.
+        self._log.debug(
+            "[EXPLAIN] BOB_API_KEY présente mais appel LLM Phase 6 non implémenté — "
+            "production_type conservé rule_based (R003-P0-D). "
+            "Jamais llm_generated sans enrichissement réel."
+        )
+        return result  # inchangé — rule_based conservé jusqu'à Phase 6
 
     def glossary_lookup(self, term: str, language: str = "fr") -> Optional[str]:
         """Retourne la définition simplifiée d'un terme juridique."""

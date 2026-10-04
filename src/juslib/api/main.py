@@ -20,7 +20,6 @@ Mode DEBUG actif — toutes les requêtes loggées.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from datetime import datetime
@@ -30,13 +29,17 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, field_validator
 
 from juslib import __version__, DEBUG_MODE
+from juslib.db import JuslibDB
 from juslib.translation.plain_language import PlainLanguageEngine, ReadingLevel
 from juslib.translation.multilingual import EU_LANGUAGES, UN_LANGUAGES, ALL_SUPPORTED_LANGUAGES
 from juslib.versioning.corpus_tracker import CorpusTracker
 
-# Sentinelle : identifiants corpus connus (sera remplacé par DB en V0.2)
-# Pour l'instant : registre en mémoire — aucun texte client ne peut passer comme source
-_CORPUS_REGISTRY: dict[str, dict] = {}  # juslib_id → {text, source_hash, source_url}
+# R003-P0-E : remplace le dict _CORPUS_REGISTRY par SQLite avec FK réelles
+# Chemin configurable via JUSLIB_DB_PATH (défaut : :memory: pour compatibilité tests)
+_db = JuslibDB(
+    db_path=os.getenv("JUSLIB_DB_PATH"),  # None → :memory:
+    debug=(os.getenv("JUSLIB_DEBUG", "true").lower() != "false"),
+)
 
 logger = logging.getLogger("juslib.api")
 logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
@@ -216,8 +219,8 @@ async def explain_from_corpus(req: ExplainFromCorpusRequest):
             detail=f"Niveau '{req.reading_level}' invalide. Valeurs : expert, intermediate, citizen"
         )
 
-    # --- Résolution depuis le corpus (V0.1.1 : mémoire ; V0.2 : DB) ---
-    corpus_entry = _CORPUS_REGISTRY.get(req.source_entity_id)
+    # --- Résolution depuis le corpus (R003-P0-E : SQLite) ---
+    corpus_entry = _db.get_corpus_entry(req.source_entity_id)
     if not corpus_entry:
         raise HTTPException(
             status_code=404,
@@ -234,23 +237,30 @@ async def explain_from_corpus(req: ExplainFromCorpusRequest):
             }
         )
 
-    authenticated_text = corpus_entry["text"]
-    stored_hash = corpus_entry.get("source_hash", "")
+    authenticated_text = corpus_entry["text_excerpt"]
+    # R003-P0-C : utiliser canonical_content_hash (texte normalisé) séparé de raw_source_hash
+    stored_canonical_hash = corpus_entry.get("canonical_content_hash") or ""
+    stored_raw_hash = corpus_entry.get("raw_source_hash") or ""
 
-    # Vérification hash si texte présent (R002-P0-04)
-    computed_hash = hashlib.sha256(authenticated_text.encode("utf-8")).hexdigest()
-    if stored_hash and computed_hash != stored_hash:
+    # Vérification hash canonique si présent (R003-P0-C)
+    import unicodedata
+    import re as _re
+    _normalized = unicodedata.normalize("NFC", authenticated_text)
+    _normalized = _re.sub(r"\s+", " ", _normalized).strip()
+    computed_canonical = hashlib.sha256(_normalized.encode("utf-8")).hexdigest()
+    if stored_canonical_hash and computed_canonical != stored_canonical_hash:
         logger.error(
-            "[EXPLAIN] HASH MISMATCH entity=%s stored=%s computed=%s",
-            req.source_entity_id, stored_hash[:12], computed_hash[:12],
+            "[EXPLAIN] CANONICAL HASH MISMATCH entity=%s stored=%s computed=%s",
+            req.source_entity_id, stored_canonical_hash[:12], computed_canonical[:12],
         )
         raise HTTPException(
             status_code=500,
             detail={
                 "error": "CORPUS_INTEGRITY_FAILURE",
-                "message": "Le hash du texte corpus ne correspond pas au hash stocké. "
+                "message": "Le canonical_content_hash du texte corpus ne correspond pas au hash stocké. "
                            "Intégrité du corpus compromise — arrêt de sécurité.",
                 "invariant": "INVARIANT-1 + INVARIANT-4",
+                "hash_field": "canonical_content_hash",
             }
         )
 
@@ -271,7 +281,8 @@ async def explain_from_corpus(req: ExplainFromCorpusRequest):
         "explained_text": result.explained_text,
         "confidence": result.confidence,
         "corpus_authenticated": True,
-        "source_hash_verified": bool(stored_hash),
+        "raw_source_hash_present": bool(stored_raw_hash),
+        "canonical_hash_verified": bool(stored_canonical_hash),
     }
     if result.ai_generated_warning:
         response["ai_warning"] = result.ai_generated_warning
@@ -375,3 +386,128 @@ async def supported_languages():
         "un_official": UN_LANGUAGES,
         "all": sorted(ALL_SUPPORTED_LANGUAGES),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Nouveaux endpoints R003-P0-E : index corpus, snapshot, stats DB
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IndexCorpusRequest(BaseModel):
+    """Requête d'indexation d'un document dans le corpus JUSLIB."""
+    juslib_id: str
+    title: str
+    document_type: str
+    jurisdiction: str
+    source_url: str
+    connector_id: str
+    text_excerpt: str
+    language: str = "fr"
+    eli_id: Optional[str] = None
+    celex_id: Optional[str] = None
+    ecli_id: Optional[str] = None
+    native_id: Optional[str] = None
+    entry_into_force: Optional[str] = None
+    corpus_version: Optional[str] = None
+    certainty_level: str = "unverified"
+
+
+@app.post("/v1/corpus/index", tags=["Corpus"])
+async def index_corpus_document(req: IndexCorpusRequest):
+    """
+    Indexe un document normatif dans le corpus JUSLIB (SQLite).
+
+    R003-P0-E : remplace l'ancienne opération _CORPUS_REGISTRY[id] = {...}.
+    Crée l'entrée dans legal_documents + corpus_entries.
+    canonical_content_hash calculé automatiquement côté serveur.
+    """
+    logger.debug("[API] POST /v1/corpus/index id=%s type=%s", req.juslib_id, req.document_type)
+
+    # Vérifier que l'entrée n'existe pas déjà
+    existing = _db.get_corpus_entry(req.juslib_id)
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "ALREADY_INDEXED",
+                "message": f"L'identifiant '{req.juslib_id}' est déjà présent dans le corpus. "
+                           "INSERT-only — utiliser un nouvel identifiant pour une nouvelle version.",
+                "invariant": "INVARIANT-2",
+            }
+        )
+
+    try:
+        doc_id = _db.insert_document(
+            title=req.title,
+            document_type=req.document_type,
+            jurisdiction=req.jurisdiction,
+            source_url=req.source_url,
+            connector_id=req.connector_id,
+            language=req.language,
+            eli_id=req.eli_id,
+            celex_id=req.celex_id,
+            ecli_id=req.ecli_id,
+            native_id=req.native_id,
+            entry_into_force=req.entry_into_force,
+            corpus_version=req.corpus_version,
+            certainty_level=req.certainty_level,
+        )
+        _db.index_corpus_entry(
+            juslib_id=doc_id,
+            text_excerpt=req.text_excerpt,
+            source_url=req.source_url,
+            corpus_version=req.corpus_version,
+        )
+    except Exception as e:
+        logger.error("[API] index_corpus_document error: %s", e)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+    return {
+        "status": "indexed",
+        "juslib_id": doc_id,
+        "canonical_hash_computed": True,
+        "invariant_2": "INSERT-only — enregistrement immuable",
+    }
+
+
+@app.get("/v1/corpus/snapshot/{document_id}", tags=["Corpus"])
+async def corpus_snapshot(
+    document_id: str,
+    on_date: str = Query(description="Date ISO 8601 (YYYY-MM-DD) — droit applicable à cette date"),
+):
+    """
+    Retourne le snapshot d'un document à une date donnée.
+    Implémente la requête : « Quel était le texte de l'article X au 25 mai 2018 ? »
+
+    Chaque provision retourne la version en vigueur à cette date.
+    Enregistre le snapshot dans legal_snapshots pour audit.
+    """
+    logger.debug("[API] GET /v1/corpus/snapshot/%s on_date=%s", document_id, on_date)
+
+    doc = _db.get_document(document_id)
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document '{document_id}' non trouvé dans le corpus."
+        )
+
+    try:
+        snapshot = _db.compute_snapshot(document_id, on_date)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+    return {
+        "document_id": document_id,
+        "snapshot_date": on_date,
+        "title": doc.get("title"),
+        "jurisdiction": doc.get("jurisdiction"),
+        "provisions_total": len(snapshot),
+        "provisions_in_force": sum(1 for s in snapshot if s["is_in_force"]),
+        "snapshot": snapshot,
+    }
+
+
+@app.get("/v1/db/stats", tags=["System"])
+async def db_stats():
+    """Statistiques de la base de données JUSLIB."""
+    logger.debug("[API] GET /v1/db/stats")
+    return _db.stats()

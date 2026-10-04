@@ -1,0 +1,66 @@
+{
+  "session": "J003",
+  "rapport": "R003",
+  "timestamp": "2026-10-04T13:31:40Z",
+  "version_avant": "0.1.1",
+  "version_apres": "0.1.2",
+  "git_sha_avant": "b55d23f",
+  "tests": {
+    "avant": { "total": 69, "pass": 69, "fail": 0 },
+    "apres": { "total": 119, "pass": 119, "fail": 0, "nouveaux": 50 }
+  },
+  "corrections": {
+    "P0-A": {
+      "description": "URLs OAuth Légifrance corrigées",
+      "fichier": "src/juslib/connectors/legifranceconnector.py",
+      "avant": "oauth.sandbox-aife.economie.gouv.fr / oauth.aife.economie.gouv.fr",
+      "apres": "sandbox-oauth.piste.gouv.fr / oauth.piste.gouv.fr",
+      "tests": ["H01", "H02", "H03", "H04", "H05", "H06"],
+      "status": "PASS"
+    },
+    "P0-B": {
+      "description": "verify_integrity() sans effet de bord (_compute_hash_readonly)",
+      "fichier": "src/juslib/models/legal_version.py",
+      "avant": "compute_canonical_hash() — écrasait canonical_content_hash avant comparaison",
+      "apres": "_compute_hash_readonly() — calcule sans stocker, lecture seule",
+      "tests": ["I01", "I02", "I03", "I04", "I05", "I06", "I07"],
+      "status": "PASS"
+    },
+    "P0-C": {
+      "description": "canonical_content_hash séparé de raw_source_hash dans /v1/explain",
+      "fichier": "src/juslib/api/main.py",
+      "avant": "source_hash générique (clé unique dans corpus_entry)",
+      "apres": "canonical_content_hash + raw_source_hash séparés, vérification NFC+collapse ws",
+      "tests": ["K12", "K13", "M01", "M02"],
+      "status": "PASS"
+    },
+    "P0-D": {
+      "description": "_enrich_with_llm() ne marque plus llm_generated sans appel réel",
+      "fichier": "src/juslib/translation/plain_language.py",
+      "avant": "production_type='llm_generated' dès que BOB_API_KEY présente (sans appel réel)",
+      "apres": "production_type='rule_based' conservé jusqu'à Phase 6 (appel LLM réel)",
+      "tests": ["J01", "J02", "J03", "J04"],
+      "status": "PASS"
+    },
+    "P0-E": {
+      "description": "JuslibDB SQLite remplace _CORPUS_REGISTRY dict mémoire",
+      "fichier": "src/juslib/db.py (NOUVEAU)",
+      "avant": "_CORPUS_REGISTRY = {} — dict Python en mémoire, pas de FK réelles",
+      "apres": "JuslibDB SQLite — 8 tables, FK réelles, INSERT-only triggers, Snapshot, ELI/CELEX/ECLI",
+      "tables": [
+        "authorities", "legal_documents", "legal_provisions", "legal_versions",
+        "legal_snapshots", "relation_evidence", "translation_records", "corpus_entries"
+      ],
+      "tests": ["K01-K16", "L01-L06", "M01-M05"],
+      "status": "PASS"
+    }
+  },
+  "nouveaux_fichiers": [
+    "src/juslib/db.py",
+    "tests/test_juslib_r003.py"
+  ],
+  "non_regression": "119/119 PASS (69 existants + 50 nouveaux R003)",
+  "certified_100": false,
+  "unique_human_proven": false,
+  "debug_mode": true
+}

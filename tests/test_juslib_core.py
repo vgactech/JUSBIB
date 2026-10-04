@@ -666,7 +666,8 @@ class TestLegalVersion:
         v.canonical_content_hash = "hash_falsifie_0000000000000000000000000000000"
         ok, errors = v.verify_integrity()
         assert not ok
-        assert any("R002-P0-03" in e for e in errors)
+        # R003-P0-B : messages mis à jour de R002-P0-03 vers R003-P0-B
+        assert any(("R002-P0-03" in e or "R003-P0-B" in e) for e in errors)
 
     def test_F06_legal_version_in_force_check(self):
         from juslib.models.legal_version import LegalVersion

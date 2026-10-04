@@ -17,9 +17,12 @@ Documentation : https://piste.gouv.fr/
      LEGIFRANCE_PISTE_ENV=sandbox|production (défaut : sandbox pour tests)
      Accès gratuit : https://developer.aife.economie.gouv.fr/
 
-R002-P0-05 : Correction URL OAuth.
-  Sandbox  → oauth.sandbox-aife.economie.gouv.fr (tests)
-  Production → oauth.aife.economie.gouv.fr        (prod)
+R003-P0-A : Correction URL OAuth (R002 était encore incorrecte).
+  Source vérifiée : https://developer.aife.economie.gouv.fr/ + doc PISTE officielle.
+  Sandbox    → https://sandbox-oauth.piste.gouv.fr/api/oauth/token
+  Production → https://oauth.piste.gouv.fr/api/oauth/token
+  API base sandbox    → https://sandbox-api.piste.gouv.fr/dila/legifrance/lf-engine-app
+  API base production → https://api.piste.gouv.fr/dila/legifrance/lf-engine-app
   Les deux environnements utilisent des credentials séparés.
 """
 
@@ -37,15 +40,16 @@ from .base_connector import BaseConnector, ConnectorResult
 
 logger = logging.getLogger("juslib.connector.legifrance")
 
-# R002-P0-05 : URLs séparées sandbox / production
-# Source : https://developer.aife.economie.gouv.fr/index.php?option=com_apiportal
+# R003-P0-A : URLs corrigées sandbox / production
+# Source officielle : https://developer.aife.economie.gouv.fr/ (doc PISTE)
+# R002 utilisait encore oauth.sandbox-aife.economie.gouv.fr — désormais incorrect.
 _PISTE_ENVS = {
     "sandbox": {
-        "token_url": "https://oauth.sandbox-aife.economie.gouv.fr/api/oauth/token",
+        "token_url": "https://sandbox-oauth.piste.gouv.fr/api/oauth/token",
         "api_base": "https://sandbox-api.piste.gouv.fr/dila/legifrance/lf-engine-app",
     },
     "production": {
-        "token_url": "https://oauth.aife.economie.gouv.fr/api/oauth/token",
+        "token_url": "https://oauth.piste.gouv.fr/api/oauth/token",
         "api_base": "https://api.piste.gouv.fr/dila/legifrance/lf-engine-app",
     },
 }
@@ -84,7 +88,7 @@ class LegifranceConnector(BaseConnector):
     """
 
     CONNECTOR_ID = "legifrance"
-    CONNECTOR_VERSION = "0.1.1"  # R002-P0-05
+    CONNECTOR_VERSION = "0.1.2"  # R003-P0-A : URLs OAuth corrigées
     SOURCE_NAME = "Légifrance — Service public de la diffusion du droit"
     SOURCE_JURISDICTION = "FR"
     BASE_URL = "https://www.legifrance.gouv.fr"
