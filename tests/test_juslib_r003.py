@@ -391,21 +391,25 @@ class TestJuslibDB:
         assert len(row["canonical_content_hash"]) == 64
 
     def test_K09_snapshot_version_at_date(self, db):
-        """K09 : get_version_at_date retourne la version en vigueur à une date."""
+        """K09 : get_version_at_date retourne la version en vigueur à une date.
+        P1-01 : la version initiale est EXPLICITEMENT fermée (valid_until) avant
+        l'insertion de la version suivante — évite le chevauchement temporel.
+        """
         doc_id = db.insert_document(
             title="RGPD", document_type="regulation", jurisdiction="EU",
             source_url="https://eur-lex.europa.eu/rgpd", connector_id="eurlex",
         )
         prov_id = db.insert_provision(doc_id, number="17")
 
-        # Version initiale : 2018-05-25 → (toujours en vigueur)
+        # Version initiale : 2018-05-25 → 2021-01-01 (fermée explicitement)
         ver1 = db.insert_version(
             provision_id=prov_id, document_id=doc_id,
             text="Version initiale.",
             valid_from="2018-05-25",
+            valid_until="2021-01-01",   # fermée — P1-01 : pas de chevauchement
             source_url="https://eur-lex.europa.eu/rgpd/art17/v1",
         )
-        # Version amendée : 2021-01-01 → (toujours en vigueur)
+        # Version amendée : 2021-01-01 → (ouverte) — pas de chevauchement avec v1 fermée
         ver2 = db.insert_version(
             provision_id=prov_id, document_id=doc_id,
             text="Version amendée.",

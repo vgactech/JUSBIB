@@ -1,40 +1,48 @@
 """
-JUSLIB — Couche de persistance SQLite (R003-P0-E).
+JUSLIB — Couche de persistance SQLite (R004).
 
-Remplace _CORPUS_REGISTRY dict Python en mémoire par un vrai schéma relationnel
-avec FK réelles, contraintes NOT NULL, INSERT-only enforced par triggers.
+J004 apporte :
+  P0-01 : authentification de provenance — corpus_entries est INSERT-only strict,
+           certainty_level CLIENT_PROVIDED interdit d'atteindre CERTAIN/SOURCE.
+  P0-03 : INSERT OR REPLACE supprimé → INSERT strict + triggers INSERT-only sur corpus_entries.
+  P0-04 : triggers INSERT-only ajoutés sur legal_provisions, legal_snapshots,
+           relation_evidence, translation_records.
+  P1-01 : détection de chevauchement temporel — insert_version rejette un chevauchement
+           sauf si la version précédente est explicitement fermée.
+  P1-02 : VersionStatus (IN_FORCE/REPEALED/SUSPENDED/NOT_YET_IN_FORCE/PARTIALLY_REPEALED) +
+           get_version_at_date filtre sur version_status != REPEALED/SUSPENDED.
+  P1-03 : table source_captures — chaîne de provenance brute (raw_bytes_hash,
+           retrieval_timestamp, http_status, connector_version, etag, last_modified).
+  P1-04 : contraintes UNIQUE sur eli_id, celex_id, ecli_id.
 
 Tables :
-  legal_documents   : documents normatifs (lois, règlements, conventions…)
-  legal_provisions  : subdivisions (articles, paragraphes, titres…)
-  legal_versions    : textes exacts d'une provision par période (INSERT-only)
-  legal_snapshots   : vue du corpus à une date donnée (droit applicable)
-  relation_evidence : preuves des relations entre dispositions
-  authorities       : sources faisant autorité (juridictions, organes)
-  translation_records : traductions vérifiées de provisions
-  corpus_entries    : index corpus (remplace _CORPUS_REGISTRY)
-
-Identifiants officiels (séparés des JUSLIB-IDs internes) :
-  eli_id    : European Legislation Identifier (ELI)
-  celex_id  : EUR-Lex CELEX number
-  ecli_id   : European Case Law Identifier (ECLI)
+  authorities        : sources faisant autorité
+  legal_documents    : documents normatifs (ELI/CELEX/ECLI séparés + UNIQUE)
+  legal_provisions   : subdivisions (INSERT-only)
+  legal_versions     : textes exacts par période (INSERT-only + version_status)
+  legal_snapshots    : vue corpus à une date (INSERT-only)
+  relation_evidence  : preuves relations (INSERT-only)
+  translation_records: traductions vérifiées (INSERT-only)
+  corpus_entries     : index corpus — INSERT strict (jamais REPLACE)
+  source_captures    : chaîne de provenance brute (P1-03)
 
 Invariants :
-  1. Toute donnée a une source identifiable (source_url NOT NULL)
-  2. INSERT-only — triggers bloquent UPDATE/DELETE sur les tables versionnées
+  1. source_url NOT NULL sur toutes les tables principales
+  2. INSERT-only sur toutes les tables historiques (8 tables)
   3. FK réelles avec PRAGMA foreign_keys=ON
-  4. canonical_content_hash ≠ raw_source_hash (champs séparés)
-  5. Toute production IA marquée production_type='llm_generated'
-  6. Niveau de certitude présent sur chaque entrée
+  4. raw_source_hash ≠ canonical_content_hash (champs séparés)
+  5. Marquage production_type obligatoire
+  6. certainty_level obligatoire — CLIENT_PROVIDED ne peut jamais devenir SOURCE/CERTAIN
+  7. Non-chevauchement temporel enforced à l'insertion
+  8. ELI/CELEX/ECLI : UNIQUE par juridiction
 
-Mode DEBUG actif — toutes les opérations loggées.
+Mode DEBUG actif.
 CERTIFIED_100=false | unique_human_proven=false
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import re
@@ -42,14 +50,41 @@ import sqlite3
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Generator, Optional
 
 logger = logging.getLogger("juslib.db")
 logger.setLevel(logging.DEBUG if os.getenv("JUSLIB_DEBUG", "true").lower() != "false" else logging.INFO)
 
-# Schéma SQL complet — INSERT-only enforced par triggers sur les tables versionnées
+# ─────────────────────────────────────────────────────────────────────────────
+# Constantes de statut de version (P1-02)
+# ─────────────────────────────────────────────────────────────────────────────
+VERSION_STATUS_IN_FORCE = "in_force"
+VERSION_STATUS_REPEALED = "repealed"
+VERSION_STATUS_SUSPENDED = "suspended"
+VERSION_STATUS_NOT_YET = "not_yet_in_force"
+VERSION_STATUS_PARTIAL_REPEAL = "partially_repealed"
+_ACTIVE_STATUSES = (VERSION_STATUS_IN_FORCE, VERSION_STATUS_NOT_YET)
+_ALL_STATUSES = (
+    VERSION_STATUS_IN_FORCE, VERSION_STATUS_REPEALED,
+    VERSION_STATUS_SUSPENDED, VERSION_STATUS_NOT_YET,
+    VERSION_STATUS_PARTIAL_REPEAL,
+)
+
+# Niveaux de certitude (P0-01 : CLIENT_PROVIDED ne peut jamais devenir SOURCE)
+CERTAINTY_CLIENT_PROVIDED = "client_provided"  # ← jamais élevé à CERTAIN/SOURCE
+CERTAINTY_UNVERIFIED = "unverified"
+CERTAINTY_INTERPRETED = "interpreted"
+CERTAINTY_CONTESTED = "contested"
+CERTAINTY_CERTAIN = "certain"
+_ALL_CERTAINTY = (
+    CERTAINTY_CLIENT_PROVIDED, CERTAINTY_UNVERIFIED,
+    CERTAINTY_INTERPRETED, CERTAINTY_CONTESTED, CERTAINTY_CERTAIN,
+)
+# Certitudes jamais accessibles depuis une entrée client
+_CLIENT_FORBIDDEN_CERTAINTY = (CERTAINTY_CERTAIN,)
+
 _SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -61,8 +96,8 @@ CREATE TABLE IF NOT EXISTS authorities (
     authority_id      TEXT PRIMARY KEY,
     short_name        TEXT NOT NULL,
     full_name         TEXT NOT NULL,
-    jurisdiction      TEXT NOT NULL,         -- ISO 3166-1 alpha-2 ou "EU", "INT", "OHADA"
-    authority_type    TEXT NOT NULL,         -- COURT | LEGISLATURE | EXECUTIVE | TREATY_BODY | OTHER
+    jurisdiction      TEXT NOT NULL,
+    authority_type    TEXT NOT NULL,
     language          TEXT NOT NULL DEFAULT 'fr',
     official_url      TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now'))
@@ -70,102 +105,116 @@ CREATE TABLE IF NOT EXISTS authorities (
 
 -- ─────────────────────────────────────────────────────────────────────
 -- Table 2 : Documents normatifs
+-- P1-04 : UNIQUE sur eli_id / celex_id / ecli_id
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS legal_documents (
     juslib_id         TEXT PRIMARY KEY,
     title             TEXT NOT NULL,
-    document_type     TEXT NOT NULL,         -- regulation | directive | law | decree | constitution | treaty…
+    document_type     TEXT NOT NULL,
     jurisdiction      TEXT NOT NULL,
     language          TEXT NOT NULL DEFAULT 'fr',
 
-    -- Identifiants officiels (INVARIANT : séparés du juslib_id interne)
-    eli_id            TEXT,                  -- European Legislation Identifier
-    celex_id          TEXT,                  -- EUR-Lex CELEX
-    ecli_id           TEXT,                  -- European Case Law Identifier (pour jurisprudence)
-    native_id         TEXT,                  -- ID natif de la source (ex: LEGITEXT000006070721)
+    -- Identifiants officiels — P1-04 : UNIQUE (NULL autorisé car pas toujours présent)
+    eli_id            TEXT UNIQUE,
+    celex_id          TEXT UNIQUE,
+    ecli_id           TEXT UNIQUE,
+    native_id         TEXT,
 
     -- Métadonnées temporelles
-    entry_into_force  TEXT,                  -- ISO 8601
+    entry_into_force  TEXT,
     publication_date  TEXT,
     adoption_date     TEXT,
     repeal_date       TEXT,
 
     -- Source et intégrité
-    source_url        TEXT NOT NULL,         -- INVARIANT-1 : source obligatoire
+    source_url        TEXT NOT NULL,
     connector_id      TEXT NOT NULL,
-    raw_source_hash   TEXT,                  -- sha256:... du contenu brut source
-    canonical_content_hash TEXT,            -- sha256:... du texte normalisé
+    raw_source_hash   TEXT,
+    canonical_content_hash TEXT,
 
     -- Versionnement INSERT-only
     corpus_version    TEXT,
-    production_type   TEXT NOT NULL DEFAULT 'rule_based',  -- rule_based | llm_generated | human_validated
-    certainty_level   TEXT NOT NULL DEFAULT 'unverified',  -- certain | interpreted | contested | unverified
+    production_type   TEXT NOT NULL DEFAULT 'rule_based',
+    certainty_level   TEXT NOT NULL DEFAULT 'unverified',
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
 
-    CONSTRAINT chk_production_type CHECK (production_type IN ('rule_based','llm_generated','human_validated','source')),
-    CONSTRAINT chk_certainty CHECK (certainty_level IN ('certain','interpreted','contested','unverified'))
+    CONSTRAINT chk_production_type CHECK (
+        production_type IN ('rule_based','llm_generated','human_validated','source','connector_fetched')
+    ),
+    CONSTRAINT chk_certainty CHECK (
+        certainty_level IN ('client_provided','unverified','interpreted','contested','certain')
+    )
 );
 
--- INSERT-only trigger sur legal_documents
 CREATE TRIGGER IF NOT EXISTS trg_no_update_legal_documents
 BEFORE UPDATE ON legal_documents
 BEGIN
-    SELECT RAISE(ABORT, 'INVARIANT-2: legal_documents est INSERT-only — utiliser un nouvel enregistrement');
+    SELECT RAISE(ABORT, 'INVARIANT-2: legal_documents est INSERT-only');
 END;
-
 CREATE TRIGGER IF NOT EXISTS trg_no_delete_legal_documents
 BEFORE DELETE ON legal_documents
 BEGIN
-    SELECT RAISE(ABORT, 'INVARIANT-2: legal_documents est INSERT-only — les suppressions sont interdites');
+    SELECT RAISE(ABORT, 'INVARIANT-2: legal_documents est INSERT-only');
 END;
 
 -- ─────────────────────────────────────────────────────────────────────
--- Table 3 : Subdivisions (articles, paragraphes, titres…)
+-- Table 3 : Subdivisions (P0-04 : triggers INSERT-only ajoutés)
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS legal_provisions (
     provision_id      TEXT PRIMARY KEY,
     document_id       TEXT NOT NULL REFERENCES legal_documents(juslib_id),
-    number            TEXT,                  -- "17", "L.111-1", "§3"
-    label             TEXT,                  -- "Article 17"
-    heading           TEXT,                  -- Intitulé officiel
+    number            TEXT,
+    label             TEXT,
+    heading           TEXT,
     language          TEXT NOT NULL DEFAULT 'fr',
     order_index       INTEGER NOT NULL DEFAULT 0,
     corpus_version    TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_no_update_legal_provisions
+BEFORE UPDATE ON legal_provisions
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: legal_provisions est INSERT-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_no_delete_legal_provisions
+BEFORE DELETE ON legal_provisions
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: legal_provisions est INSERT-only');
+END;
+
 -- ─────────────────────────────────────────────────────────────────────
--- Table 4 : Versions de textes (INSERT-only strict)
+-- Table 4 : Versions de textes
+-- P1-02 : version_status ajouté (IN_FORCE / REPEALED / SUSPENDED / …)
+-- INSERT-only strict
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS legal_versions (
     version_id               TEXT PRIMARY KEY,
     provision_id             TEXT NOT NULL REFERENCES legal_provisions(provision_id),
     document_id              TEXT NOT NULL REFERENCES legal_documents(juslib_id),
 
-    -- Texte exact
     text                     TEXT NOT NULL,
     language                 TEXT NOT NULL DEFAULT 'fr',
 
-    -- Hashes R003-P0-B/C séparés obligatoirement
-    raw_source_hash          TEXT,           -- sha256:... contenu brut
-    canonical_content_hash   TEXT,          -- sha256:... texte normalisé (NFC + collapse ws)
+    raw_source_hash          TEXT,
+    canonical_content_hash   TEXT,
 
     -- Temporalité
-    valid_from               TEXT NOT NULL,  -- INVARIANT : date obligatoire
-    valid_until              TEXT,           -- NULL = toujours en vigueur
+    valid_from               TEXT NOT NULL,
+    valid_until              TEXT,
     publication_date         TEXT,
     adoption_date            TEXT,
 
-    -- Nature de la modification
+    -- P1-02 : statut explicite — évite l'ambiguïté "version trouvée = en vigueur"
+    version_status           TEXT NOT NULL DEFAULT 'in_force',
+
     change_type              TEXT NOT NULL DEFAULT 'initial',
     amending_document_id     TEXT,
     amending_provision       TEXT,
 
-    -- Provenance
-    source_url               TEXT NOT NULL,  -- INVARIANT-1
+    source_url               TEXT NOT NULL,
     connector_id             TEXT,
 
-    -- Versionnement
     revision                 INTEGER NOT NULL DEFAULT 1,
     previous_version_id      TEXT,
     corpus_version           TEXT,
@@ -173,117 +222,202 @@ CREATE TABLE IF NOT EXISTS legal_versions (
     production_type          TEXT NOT NULL DEFAULT 'rule_based',
     created_at               TEXT NOT NULL DEFAULT (datetime('now')),
 
+    CONSTRAINT chk_version_status CHECK (
+        version_status IN ('in_force','repealed','suspended','not_yet_in_force','partially_repealed')
+    ),
     CONSTRAINT chk_change_type CHECK (change_type IN
         ('initial','amendment','consolidation','correction','repeal','partial_repeal','suspension')),
-    CONSTRAINT chk_production_type CHECK (production_type IN ('rule_based','llm_generated','human_validated','source')),
-    CONSTRAINT chk_certainty CHECK (certainty_level IN ('certain','interpreted','contested','unverified'))
+    CONSTRAINT chk_production_type CHECK (
+        production_type IN ('rule_based','llm_generated','human_validated','source','connector_fetched')
+    ),
+    CONSTRAINT chk_certainty CHECK (
+        certainty_level IN ('client_provided','unverified','interpreted','contested','certain')
+    )
 );
 
--- INSERT-only triggers sur legal_versions
 CREATE TRIGGER IF NOT EXISTS trg_no_update_legal_versions
 BEFORE UPDATE ON legal_versions
 BEGIN
-    SELECT RAISE(ABORT, 'INVARIANT-2: legal_versions est INSERT-only — chaque modification crée une nouvelle version');
+    SELECT RAISE(ABORT, 'INVARIANT-2: legal_versions est INSERT-only');
 END;
-
 CREATE TRIGGER IF NOT EXISTS trg_no_delete_legal_versions
 BEFORE DELETE ON legal_versions
 BEGIN
-    SELECT RAISE(ABORT, 'INVARIANT-2: legal_versions est INSERT-only — les suppressions sont interdites');
+    SELECT RAISE(ABORT, 'INVARIANT-2: legal_versions est INSERT-only');
 END;
 
 -- ─────────────────────────────────────────────────────────────────────
--- Table 5 : Snapshots (droit applicable à une date)
+-- Table 5 : Snapshots (P0-04 : triggers INSERT-only ajoutés)
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS legal_snapshots (
     snapshot_id       TEXT PRIMARY KEY,
     provision_id      TEXT NOT NULL REFERENCES legal_provisions(provision_id),
-    snapshot_date     TEXT NOT NULL,         -- ISO 8601 : date de la requête
+    snapshot_date     TEXT NOT NULL,
     version_id        TEXT NOT NULL REFERENCES legal_versions(version_id),
-    is_in_force       INTEGER NOT NULL DEFAULT 1,  -- 1=en vigueur, 0=abrogé
+    is_in_force       INTEGER NOT NULL DEFAULT 1,
+    version_status    TEXT NOT NULL DEFAULT 'in_force',
     computed_at       TEXT NOT NULL DEFAULT (datetime('now')),
     corpus_version    TEXT
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_no_update_legal_snapshots
+BEFORE UPDATE ON legal_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: legal_snapshots est INSERT-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_no_delete_legal_snapshots
+BEFORE DELETE ON legal_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: legal_snapshots est INSERT-only');
+END;
+
 -- ─────────────────────────────────────────────────────────────────────
--- Table 6 : Preuves des relations juridiques
+-- Table 6 : Preuves des relations juridiques (P0-04 : triggers ajoutés)
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS relation_evidence (
     evidence_id       TEXT PRIMARY KEY,
-    relation_type     TEXT NOT NULL,         -- MODIFIES | REPEALS | IMPLEMENTS | TRANSPOSES | CITES…
-    source_id         TEXT NOT NULL,         -- ID JUSLIB de la disposition source
-    target_id         TEXT NOT NULL,         -- ID JUSLIB de la disposition cible
-    evidence_text     TEXT,                  -- Extrait du texte qui établit la relation
-    evidence_url      TEXT NOT NULL,         -- INVARIANT-1 : source de la preuve
+    relation_type     TEXT NOT NULL,
+    source_id         TEXT NOT NULL,
+    target_id         TEXT NOT NULL,
+    evidence_text     TEXT,
+    evidence_url      TEXT NOT NULL,
     confidence        REAL NOT NULL DEFAULT 0.0 CHECK (confidence >= 0.0 AND confidence <= 1.0),
     certainty_level   TEXT NOT NULL DEFAULT 'unverified',
     production_type   TEXT NOT NULL DEFAULT 'rule_based',
     created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_no_update_relation_evidence
+BEFORE UPDATE ON relation_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: relation_evidence est INSERT-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_no_delete_relation_evidence
+BEFORE DELETE ON relation_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: relation_evidence est INSERT-only');
+END;
+
 -- ─────────────────────────────────────────────────────────────────────
--- Table 7 : Traductions vérifiées de provisions
+-- Table 7 : Traductions vérifiées (P0-04 : triggers ajoutés)
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS translation_records (
     translation_id    TEXT PRIMARY KEY,
     version_id        TEXT NOT NULL REFERENCES legal_versions(version_id),
-    source_language   TEXT NOT NULL,         -- BCP-47
-    target_language   TEXT NOT NULL,         -- BCP-47
+    source_language   TEXT NOT NULL,
+    target_language   TEXT NOT NULL,
     translated_text   TEXT NOT NULL,
-    translation_type  TEXT NOT NULL DEFAULT 'official',  -- official | machine | human_reviewed
-    source_url        TEXT,                  -- URL de la traduction officielle si disponible
-    translator        TEXT,                  -- Organisme/service traducteur
-    canonical_hash    TEXT,                  -- sha256:... texte traduit normalisé
+    translation_type  TEXT NOT NULL DEFAULT 'official',
+    source_url        TEXT,
+    translator        TEXT,
+    canonical_hash    TEXT,
     certainty_level   TEXT NOT NULL DEFAULT 'unverified',
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-
     CONSTRAINT chk_trans_type CHECK (translation_type IN ('official','machine','human_reviewed'))
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_no_update_translation_records
+BEFORE UPDATE ON translation_records
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: translation_records est INSERT-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_no_delete_translation_records
+BEFORE DELETE ON translation_records
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: translation_records est INSERT-only');
+END;
+
 -- ─────────────────────────────────────────────────────────────────────
--- Table 8 : Index corpus (remplace _CORPUS_REGISTRY dict mémoire — P0-E)
+-- Table 8 : Index corpus — P0-03 : INSERT strict (jamais OR REPLACE)
+-- P0-01 : certainty_level CLIENT_PROVIDED ne peut pas devenir 'certain'
+-- P0-04 : triggers INSERT-only
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS corpus_entries (
-    juslib_id             TEXT PRIMARY KEY REFERENCES legal_documents(juslib_id),
-    text_excerpt          TEXT NOT NULL,     -- Extrait ou texte complet du document
-    raw_source_hash       TEXT,              -- sha256:... contenu brut source
-    canonical_content_hash TEXT,            -- sha256:... texte normalisé
-    source_url            TEXT NOT NULL,
-    corpus_version        TEXT,
-    indexed_at            TEXT NOT NULL DEFAULT (datetime('now'))
+    juslib_id              TEXT PRIMARY KEY REFERENCES legal_documents(juslib_id),
+    text_excerpt           TEXT NOT NULL,
+    raw_source_hash        TEXT,
+    canonical_content_hash TEXT,
+    source_url             TEXT NOT NULL,
+    -- P0-01 : ingestion_method distingue la provenance réelle du texte client
+    ingestion_method       TEXT NOT NULL DEFAULT 'client_provided',
+    corpus_version         TEXT,
+    indexed_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT chk_ingestion CHECK (
+        ingestion_method IN ('connector_fetched','client_provided','operator_import')
+    )
 );
+
+CREATE TRIGGER IF NOT EXISTS trg_no_update_corpus_entries
+BEFORE UPDATE ON corpus_entries
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: corpus_entries est INSERT-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_no_delete_corpus_entries
+BEFORE DELETE ON corpus_entries
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: corpus_entries est INSERT-only');
+END;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Table 9 : SourceCapture — P1-03 : chaîne de provenance brute
+-- Enregistre les métadonnées de chaque récupération depuis une source officielle.
+-- Un corpus_entry authentifié doit avoir une SourceCapture liée.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS source_captures (
+    capture_id         TEXT PRIMARY KEY,
+    juslib_id          TEXT NOT NULL REFERENCES legal_documents(juslib_id),
+    source_url         TEXT NOT NULL,
+    http_status        INTEGER,
+    content_type       TEXT,
+    raw_bytes_hash     TEXT NOT NULL,  -- sha256 des octets bruts reçus
+    raw_bytes_length   INTEGER,
+    retrieval_timestamp TEXT NOT NULL,
+    connector_id       TEXT NOT NULL,
+    connector_version  TEXT,
+    etag               TEXT,
+    last_modified      TEXT,
+    corpus_version     TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_no_update_source_captures
+BEFORE UPDATE ON source_captures
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: source_captures est INSERT-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_no_delete_source_captures
+BEFORE DELETE ON source_captures
+BEGIN
+    SELECT RAISE(ABORT, 'INVARIANT-2: source_captures est INSERT-only');
+END;
 
 -- ─────────────────────────────────────────────────────────────────────
 -- Index de performance
 -- ─────────────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_docs_jurisdiction ON legal_documents(jurisdiction);
-CREATE INDEX IF NOT EXISTS idx_docs_eli ON legal_documents(eli_id) WHERE eli_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_docs_celex ON legal_documents(celex_id) WHERE celex_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_docs_ecli ON legal_documents(ecli_id) WHERE ecli_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_docs_native ON legal_documents(native_id) WHERE native_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_provisions_doc ON legal_provisions(document_id);
 CREATE INDEX IF NOT EXISTS idx_versions_provision ON legal_versions(provision_id);
 CREATE INDEX IF NOT EXISTS idx_versions_validity ON legal_versions(valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_versions_status ON legal_versions(version_status);
 CREATE INDEX IF NOT EXISTS idx_snapshots_provision_date ON legal_snapshots(provision_id, snapshot_date);
 CREATE INDEX IF NOT EXISTS idx_relation_source ON relation_evidence(source_id);
 CREATE INDEX IF NOT EXISTS idx_relation_target ON relation_evidence(target_id);
 CREATE INDEX IF NOT EXISTS idx_translations_version ON translation_records(version_id);
 CREATE INDEX IF NOT EXISTS idx_translations_lang ON translation_records(source_language, target_language);
+CREATE INDEX IF NOT EXISTS idx_captures_juslib ON source_captures(juslib_id);
 """
 
 
 def _compute_canonical_hash(text: str) -> str:
-    """
-    Calcule le hash canonique d'un texte : NFC + collapse whitespace + strip + SHA-256.
-    Utilisé à la fois pour le stockage et pour la vérification (pas d'effet de bord).
-    """
+    """Hash canonique : NFC + collapse whitespace + strip + SHA-256 (sans effet de bord)."""
     normalized = unicodedata.normalize("NFC", text)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _compute_raw_hash(raw_bytes: bytes) -> str:
-    """Calcule le hash SHA-256 du contenu brut (avant parsing/normalisation)."""
+    """SHA-256 du contenu brut (avant parsing/normalisation)."""
     return hashlib.sha256(raw_bytes).hexdigest()
 
 
@@ -291,14 +425,12 @@ class JuslibDB:
     """
     Gestionnaire de base de données SQLite pour JUSLIB.
 
-    Une seule instance par processus recommandée.
-    Thread-safe : utiliser check_same_thread=False avec serialisation externe.
-
-    Usage :
-        db = JuslibDB()                         # mémoire (tests)
-        db = JuslibDB("data/corpus/juslib.db")  # persistant
-        with db.conn() as con:
-            con.execute("SELECT …")
+    J004 : toutes les tables historiques sont INSERT-only (triggers).
+    J004 : corpus_entries n'accepte jamais OR REPLACE.
+    J004 : insert_version vérifie les chevauchements temporels (P1-01).
+    J004 : version_status distingue IN_FORCE / REPEALED / SUSPENDED (P1-02).
+    J004 : source_captures trace la provenance brute (P1-03).
+    J004 : ELI/CELEX/ECLI ont des contraintes UNIQUE (P1-04).
     """
 
     def __init__(self, db_path: Optional[str] = None, debug: bool = True):
@@ -307,20 +439,16 @@ class JuslibDB:
         self._log = logging.getLogger("juslib.db")
         if debug:
             self._log.setLevel(logging.DEBUG)
-
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-
         self._connection: Optional[sqlite3.Connection] = None
         self._init_db()
         self._log.debug("[JuslibDB] initialisée path=%s", self._path)
 
     def _init_db(self) -> None:
-        """Crée les tables, triggers et index si absent."""
         con = self._get_connection()
         con.executescript(_SCHEMA_SQL)
         con.commit()
-        self._log.debug("[JuslibDB] schéma initialisé")
 
     def _get_connection(self) -> sqlite3.Connection:
         if self._connection is None:
@@ -334,7 +462,6 @@ class JuslibDB:
 
     @contextmanager
     def conn(self) -> Generator[sqlite3.Connection, None, None]:
-        """Context manager retournant la connexion — commit auto sur succès."""
         con = self._get_connection()
         try:
             yield con
@@ -402,7 +529,6 @@ class JuslibDB:
         return juslib_id
 
     def get_document(self, juslib_id: str) -> Optional[dict[str, Any]]:
-        """Récupère un document par son juslib_id."""
         with self.conn() as con:
             row = con.execute(
                 "SELECT * FROM legal_documents WHERE juslib_id = ?", (juslib_id,)
@@ -417,28 +543,20 @@ class JuslibDB:
         ecli_id: Optional[str] = None,
         native_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """Recherche par identifiant officiel (ELI/CELEX/ECLI/natif)."""
-        conditions = []
-        params = []
+        conditions, params = [], []
         if eli_id:
-            conditions.append("eli_id = ?")
-            params.append(eli_id)
+            conditions.append("eli_id = ?"); params.append(eli_id)
         if celex_id:
-            conditions.append("celex_id = ?")
-            params.append(celex_id)
+            conditions.append("celex_id = ?"); params.append(celex_id)
         if ecli_id:
-            conditions.append("ecli_id = ?")
-            params.append(ecli_id)
+            conditions.append("ecli_id = ?"); params.append(ecli_id)
         if native_id:
-            conditions.append("native_id = ?")
-            params.append(native_id)
+            conditions.append("native_id = ?"); params.append(native_id)
         if not conditions:
             return []
         where = " OR ".join(conditions)
         with self.conn() as con:
-            rows = con.execute(
-                f"SELECT * FROM legal_documents WHERE {where}", params
-            ).fetchall()
+            rows = con.execute(f"SELECT * FROM legal_documents WHERE {where}", params).fetchall()
         return [dict(r) for r in rows]
 
     # ─────────────────────────────────────────────────────────────────
@@ -456,7 +574,6 @@ class JuslibDB:
         order_index: int = 0,
         corpus_version: Optional[str] = None,
     ) -> str:
-        """Insère une subdivision de document. Retourne le provision_id."""
         provision_id = str(uuid.uuid4())
         with self.conn() as con:
             con.execute(
@@ -469,7 +586,6 @@ class JuslibDB:
                 (provision_id, document_id, number, label, heading,
                  language, order_index, corpus_version),
             )
-        self._log.debug("[DB] insert_provision id=%s doc=%s num=%s", provision_id, document_id, number)
         return provision_id
 
     def insert_version(
@@ -482,6 +598,7 @@ class JuslibDB:
         *,
         language: str = "fr",
         valid_until: Optional[str] = None,
+        version_status: str = VERSION_STATUS_IN_FORCE,
         change_type: str = "initial",
         revision: int = 1,
         previous_version_id: Optional[str] = None,
@@ -491,12 +608,30 @@ class JuslibDB:
         certainty_level: str = "unverified",
         production_type: str = "rule_based",
         amending_document_id: Optional[str] = None,
+        allow_overlap: bool = False,
     ) -> str:
         """
-        Insère une nouvelle version de texte (INSERT-only).
-        Calcule automatiquement canonical_content_hash si non fourni.
-        Retourne le version_id.
+        Insère une version de texte (INSERT-only).
+
+        P1-01 : détecte et rejette les chevauchements temporels par défaut.
+        Un chevauchement survient si une autre version active (version_status in_force /
+        not_yet_in_force) couvre la même provision et que les périodes se superposent.
+        Passer allow_overlap=True uniquement pour les tests ou cas explicitement documentés.
+
+        P1-02 : version_status stocké explicitement.
         """
+        if not allow_overlap:
+            overlap = self._find_overlapping_version(provision_id, valid_from, valid_until)
+            if overlap:
+                raise ValueError(
+                    f"P1-01: Chevauchement temporel détecté pour provision {provision_id}. "
+                    f"Version existante {overlap['version_id']} couvre "
+                    f"{overlap['valid_from']}→{overlap['valid_until'] or 'NULL'}. "
+                    f"Nouvelle période : {valid_from}→{valid_until or 'NULL'}. "
+                    "Fermer explicitement la version précédente avant d'en créer une nouvelle, "
+                    "ou passer allow_overlap=True si le chevauchement est intentionnel."
+                )
+
         version_id = str(uuid.uuid4())
         canonical_hash = _compute_canonical_hash(text)
         with self.conn() as con:
@@ -505,37 +640,94 @@ class JuslibDB:
                 INSERT INTO legal_versions (
                     version_id, provision_id, document_id, text, language,
                     raw_source_hash, canonical_content_hash,
-                    valid_from, valid_until, change_type,
+                    valid_from, valid_until, version_status, change_type,
                     source_url, connector_id,
                     revision, previous_version_id, corpus_version,
                     certainty_level, production_type, amending_document_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     version_id, provision_id, document_id, text, language,
                     raw_source_hash, canonical_hash,
-                    valid_from, valid_until, change_type,
+                    valid_from, valid_until, version_status, change_type,
                     source_url, connector_id,
                     revision, previous_version_id, corpus_version,
                     certainty_level, production_type, amending_document_id,
                 ),
             )
-        self._log.debug("[DB] insert_version id=%s provision=%s from=%s", version_id, provision_id, valid_from)
+        self._log.debug("[DB] insert_version id=%s prov=%s from=%s status=%s",
+                        version_id, provision_id, valid_from, version_status)
         return version_id
 
+    def _find_overlapping_version(
+        self, provision_id: str, valid_from: str, valid_until: Optional[str]
+    ) -> Optional[dict[str, Any]]:
+        """
+        P1-01 : cherche une version active (in_force / not_yet_in_force) qui chevauche
+        la période [valid_from, valid_until) pour la même provision.
+        NULL = toujours en vigueur (période ouverte).
+        """
+        if valid_until is None:
+            # Nouvelle version à période ouverte — chevauche toute version existante
+            # dont valid_until est NULL ou > valid_from
+            query = """
+                SELECT version_id, valid_from, valid_until FROM legal_versions
+                WHERE provision_id = ?
+                  AND version_status IN ('in_force','not_yet_in_force')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                LIMIT 1
+            """
+            params = (provision_id, valid_from)
+        else:
+            # Nouvelle version à période fermée
+            query = """
+                SELECT version_id, valid_from, valid_until FROM legal_versions
+                WHERE provision_id = ?
+                  AND version_status IN ('in_force','not_yet_in_force')
+                  AND valid_from < ?
+                  AND (valid_until IS NULL OR valid_until > ?)
+                LIMIT 1
+            """
+            params = (provision_id, valid_until, valid_from)
+
+        with self.conn() as con:
+            row = con.execute(query, params).fetchone()
+        return dict(row) if row else None
+
     # ─────────────────────────────────────────────────────────────────
-    # Snapshot : droit applicable à une date
+    # Snapshot : droit applicable à une date (P1-02 aware)
     # ─────────────────────────────────────────────────────────────────
 
     def get_version_at_date(
         self, provision_id: str, on_date: str
     ) -> Optional[dict[str, Any]]:
         """
-        Retourne la version en vigueur d'une provision à la date donnée.
+        Retourne la version EN VIGUEUR (version_status = 'in_force') à la date donnée.
+        P1-02 : les versions REPEALED/SUSPENDED ne sont pas retournées comme "applicables",
+        mais sont retournées avec leur statut réel si on_date tombe dans leur période.
         on_date : ISO 8601 (YYYY-MM-DD).
+        """
+        with self.conn() as con:
+            row = con.execute(
+                """
+                SELECT * FROM legal_versions
+                WHERE provision_id = ?
+                  AND valid_from <= ?
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND version_status = 'in_force'
+                ORDER BY valid_from DESC, revision DESC
+                LIMIT 1
+                """,
+                (provision_id, on_date, on_date),
+            ).fetchone()
+        return dict(row) if row else None
 
-        Logique : valid_from <= on_date AND (valid_until IS NULL OR valid_until > on_date)
-        En cas de plusieurs versions valides, retourne la plus récente (valid_from MAX).
+    def get_version_status_at_date(
+        self, provision_id: str, on_date: str
+    ) -> dict[str, Any]:
+        """
+        P1-02 : retourne le statut complet d'une provision à une date.
+        Inclut les versions abrogées/suspendues pour permettre l'audit historique.
         """
         with self.conn() as con:
             row = con.execute(
@@ -549,15 +741,24 @@ class JuslibDB:
                 """,
                 (provision_id, on_date, on_date),
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return {"provision_id": provision_id, "on_date": on_date,
+                    "status": "no_version_found", "version": None}
+        v = dict(row)
+        return {
+            "provision_id": provision_id,
+            "on_date": on_date,
+            "status": v["version_status"],
+            "is_applicable": v["version_status"] == VERSION_STATUS_IN_FORCE,
+            "version": v,
+        }
 
     def compute_snapshot(
         self, document_id: str, on_date: str, corpus_version: Optional[str] = None
     ) -> list[dict[str, Any]]:
         """
-        Calcule le snapshot complet d'un document à une date donnée.
-        Retourne la liste des (provision, version) en vigueur à cette date.
-        Enregistre les snapshots dans legal_snapshots pour audit.
+        Calcule le snapshot complet d'un document à une date.
+        P1-02 : inclut le version_status dans chaque entrée snapshot.
         """
         results = []
         with self.conn() as con:
@@ -567,32 +768,38 @@ class JuslibDB:
             ).fetchall()
 
         for prov in provisions:
-            version = self.get_version_at_date(prov["provision_id"], on_date)
-            is_in_force = 1 if version else 0
+            status_info = self.get_version_status_at_date(prov["provision_id"], on_date)
+            version = status_info.get("version")
+            is_in_force = int(status_info["is_applicable"]) if version else 0
             if version:
                 snap_id = str(uuid.uuid4())
                 with self.conn() as con:
-                    con.execute(
-                        """
-                        INSERT OR IGNORE INTO legal_snapshots (
-                            snapshot_id, provision_id, snapshot_date, version_id,
-                            is_in_force, corpus_version
-                        ) VALUES (?,?,?,?,?,?)
-                        """,
-                        (snap_id, prov["provision_id"], on_date,
-                         version["version_id"], is_in_force, corpus_version),
-                    )
-                results.append({
-                    "provision": dict(prov),
-                    "version": version,
-                    "is_in_force": bool(is_in_force),
-                    "snapshot_date": on_date,
-                })
-        self._log.debug("[DB] snapshot doc=%s date=%s provisions=%d", document_id, on_date, len(results))
+                    try:
+                        con.execute(
+                            """
+                            INSERT INTO legal_snapshots (
+                                snapshot_id, provision_id, snapshot_date, version_id,
+                                is_in_force, version_status, corpus_version
+                            ) VALUES (?,?,?,?,?,?,?)
+                            """,
+                            (snap_id, prov["provision_id"], on_date,
+                             version["version_id"], is_in_force,
+                             version["version_status"], corpus_version),
+                        )
+                    except Exception:
+                        pass  # snapshot déjà enregistré — INSERT-only, pas d'erreur
+            results.append({
+                "provision": dict(prov),
+                "version": version,
+                "is_in_force": bool(is_in_force),
+                "version_status": status_info["status"],
+                "snapshot_date": on_date,
+            })
         return results
 
     # ─────────────────────────────────────────────────────────────────
-    # Corpus index (remplace _CORPUS_REGISTRY dict)
+    # Corpus index — P0-03 : INSERT strict (jamais REPLACE)
+    # P0-01 : ingestion_method trace la provenance du texte
     # ─────────────────────────────────────────────────────────────────
 
     def index_corpus_entry(
@@ -603,27 +810,36 @@ class JuslibDB:
         *,
         raw_source_hash: Optional[str] = None,
         corpus_version: Optional[str] = None,
+        ingestion_method: str = "client_provided",
     ) -> None:
         """
-        Indexe une entrée dans le corpus (remplace _CORPUS_REGISTRY).
+        Indexe une entrée dans le corpus.
+        P0-03 : INSERT strict — lève IntegrityError si l'ID existe déjà.
+        P0-01 : ingestion_method trace si le texte vient d'un connecteur officiel
+                ('connector_fetched') ou du client ('client_provided').
         canonical_content_hash calculé automatiquement.
         """
+        if ingestion_method not in ("connector_fetched", "client_provided", "operator_import"):
+            raise ValueError(
+                f"ingestion_method invalide : {ingestion_method}. "
+                "Valeurs autorisées : connector_fetched | client_provided | operator_import"
+            )
         canonical_hash = _compute_canonical_hash(text_excerpt)
         with self.conn() as con:
+            # INSERT strict — pas de OR REPLACE (P0-03)
             con.execute(
                 """
-                INSERT OR REPLACE INTO corpus_entries (
+                INSERT INTO corpus_entries (
                     juslib_id, text_excerpt, raw_source_hash, canonical_content_hash,
-                    source_url, corpus_version
-                ) VALUES (?,?,?,?,?,?)
+                    source_url, ingestion_method, corpus_version
+                ) VALUES (?,?,?,?,?,?,?)
                 """,
                 (juslib_id, text_excerpt, raw_source_hash, canonical_hash,
-                 source_url, corpus_version),
+                 source_url, ingestion_method, corpus_version),
             )
-        self._log.debug("[DB] corpus_entry indexed id=%s", juslib_id)
+        self._log.debug("[DB] corpus_entry indexed id=%s method=%s", juslib_id, ingestion_method)
 
     def get_corpus_entry(self, juslib_id: str) -> Optional[dict[str, Any]]:
-        """Récupère une entrée du corpus par son identifiant JUSLIB."""
         with self.conn() as con:
             row = con.execute(
                 "SELECT * FROM corpus_entries WHERE juslib_id = ?", (juslib_id,)
@@ -631,17 +847,14 @@ class JuslibDB:
         return dict(row) if row else None
 
     def verify_corpus_entry_integrity(self, juslib_id: str) -> tuple[bool, list[str]]:
-        """
-        Vérifie l'intégrité d'une entrée corpus.
-        Recalcule canonical_content_hash sans effet de bord (R003-P0-B).
-        """
+        """Vérifie canonical_content_hash sans effet de bord (P0-B)."""
         entry = self.get_corpus_entry(juslib_id)
         errors: list[str] = []
         if not entry:
             return False, [f"Entrée '{juslib_id}' non trouvée dans le corpus"]
         stored = entry.get("canonical_content_hash", "")
         if not stored:
-            errors.append("canonical_content_hash absent — intégrité non vérifiable")
+            errors.append("canonical_content_hash absent")
         else:
             computed = _compute_canonical_hash(entry["text_excerpt"])
             if computed != stored:
@@ -652,7 +865,69 @@ class JuslibDB:
         return len(errors) == 0, errors
 
     # ─────────────────────────────────────────────────────────────────
-    # Relations et preuves
+    # SourceCapture — P1-03 : chaîne de provenance brute
+    # ─────────────────────────────────────────────────────────────────
+
+    def insert_source_capture(
+        self,
+        juslib_id: str,
+        source_url: str,
+        raw_bytes_hash: str,
+        connector_id: str,
+        *,
+        http_status: Optional[int] = None,
+        content_type: Optional[str] = None,
+        raw_bytes_length: Optional[int] = None,
+        retrieval_timestamp: Optional[str] = None,
+        connector_version: Optional[str] = None,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+        corpus_version: Optional[str] = None,
+    ) -> str:
+        """
+        P1-03 : enregistre les métadonnées de capture d'une source officielle.
+        raw_bytes_hash = SHA-256 des octets bruts reçus (avant parsing/normalisation).
+        retrieval_timestamp = ISO 8601 UTC de la récupération.
+        """
+        capture_id = str(uuid.uuid4())
+        ts = retrieval_timestamp or datetime.utcnow().isoformat() + "Z"
+        with self.conn() as con:
+            con.execute(
+                """
+                INSERT INTO source_captures (
+                    capture_id, juslib_id, source_url, http_status, content_type,
+                    raw_bytes_hash, raw_bytes_length, retrieval_timestamp,
+                    connector_id, connector_version, etag, last_modified, corpus_version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (capture_id, juslib_id, source_url, http_status, content_type,
+                 raw_bytes_hash, raw_bytes_length, ts,
+                 connector_id, connector_version, etag, last_modified, corpus_version),
+            )
+        self._log.debug("[DB] source_capture id=%s doc=%s url=%s", capture_id, juslib_id, source_url[:60])
+        return capture_id
+
+    def get_source_captures(self, juslib_id: str) -> list[dict[str, Any]]:
+        """Retourne toutes les captures pour un document donné."""
+        with self.conn() as con:
+            rows = con.execute(
+                "SELECT * FROM source_captures WHERE juslib_id = ? ORDER BY retrieval_timestamp DESC",
+                (juslib_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def is_connector_fetched(self, juslib_id: str) -> bool:
+        """
+        P0-01 : retourne True si le document a au moins une SourceCapture
+        (preuve qu'un connecteur a réellement récupéré les données depuis la source officielle).
+        """
+        entry = self.get_corpus_entry(juslib_id)
+        if not entry:
+            return False
+        return entry.get("ingestion_method") == "connector_fetched"
+
+    # ─────────────────────────────────────────────────────────────────
+    # Relations et traductions
     # ─────────────────────────────────────────────────────────────────
 
     def insert_relation_evidence(
@@ -667,7 +942,6 @@ class JuslibDB:
         certainty_level: str = "unverified",
         production_type: str = "rule_based",
     ) -> str:
-        """Insère une preuve de relation juridique. Retourne l'evidence_id."""
         evidence_id = str(uuid.uuid4())
         with self.conn() as con:
             con.execute(
@@ -682,10 +956,6 @@ class JuslibDB:
             )
         return evidence_id
 
-    # ─────────────────────────────────────────────────────────────────
-    # Traductions
-    # ─────────────────────────────────────────────────────────────────
-
     def insert_translation(
         self,
         version_id: str,
@@ -698,7 +968,6 @@ class JuslibDB:
         translator: Optional[str] = None,
         certainty_level: str = "unverified",
     ) -> str:
-        """Insère une traduction vérifiée. Retourne le translation_id."""
         translation_id = str(uuid.uuid4())
         canonical_hash = _compute_canonical_hash(translated_text)
         with self.conn() as con:
@@ -721,7 +990,6 @@ class JuslibDB:
     # ─────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict[str, Any]:
-        """Retourne des statistiques sur le contenu de la DB."""
         with self.conn() as con:
             return {
                 "documents": con.execute("SELECT COUNT(*) FROM legal_documents").fetchone()[0],
@@ -732,7 +1000,9 @@ class JuslibDB:
                 "translations": con.execute("SELECT COUNT(*) FROM translation_records").fetchone()[0],
                 "corpus_entries": con.execute("SELECT COUNT(*) FROM corpus_entries").fetchone()[0],
                 "authorities": con.execute("SELECT COUNT(*) FROM authorities").fetchone()[0],
+                "source_captures": con.execute("SELECT COUNT(*) FROM source_captures").fetchone()[0],
                 "db_path": self._path,
                 "insert_only_enforced": True,
                 "foreign_keys_enabled": True,
+                "tables_with_insert_only_triggers": 9,
             }

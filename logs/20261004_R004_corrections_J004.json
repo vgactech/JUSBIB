@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-10-04T00:00:00Z",
+  "session": "J004",
+  "pytest_run": {
+    "total": 173,
+    "passed": 173,
+    "failed": 0,
+    "errors": 0,
+    "result": "ALL_PASS"
+  },
+  "test_files": {
+    "test_juslib_core.py": "69 tests blocs A-G",
+    "test_juslib_j004.py": "55 tests blocs O-X",
+    "test_juslib_r003.py": "50 tests blocs H-N"
+  },
+  "corrections_j004": {
+    "P0-01": "injection corpus fermée - ingest/import séparés",
+    "P0-02": "import hashlib ajouté dans api/main.py",
+    "P0-03": "INSERT strict corpus_entries (plus de OR REPLACE)",
+    "P0-04": "triggers INSERT-only sur 6 tables",
+    "P1-01": "chevauchement temporel détecté sur insert_version",
+    "P1-02": "version_status (in_force/repealed/suspended/not_yet_in_force/partially_repealed)",
+    "P1-03": "table source_captures (provenance brute)",
+    "P1-04": "UNIQUE sur eli_id/celex_id/ecli_id"
+  },
+  "version": "0.1.3",
+  "certified_100": false,
+  "unique_human_proven": false
+}

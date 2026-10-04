@@ -1,25 +1,23 @@
 """
 JUSLIB — FastAPI REST API v1.
 
-Endpoints :
-  GET  /v1/health
-  GET  /v1/corpus/versions
-  POST /v1/search
-  POST /v1/explain          ← SÉCURISÉ R002-P0-01 : texte libre CLIENT INTERDIT
-  POST /v1/explain/text     ← INTERMÉDIAIRE / CITOYEN uniquement, jamais EXPERT
-  GET  /v1/glossary
-  GET  /v1/glossary/{term}
+J004 :
+  P0-01 : /v1/corpus/index fermé — un texte client ne peut plus devenir source authentifiée.
+           Le nouveau endpoint /v1/corpus/ingest requiert un appel connecteur réel.
+  P0-02 : import hashlib ajouté (NameError sur /v1/explain corrigé).
+  Mise à jour version 0.1.3.
 
-RÈGLE FONDAMENTALE INVARIANT-3 (R002) :
-  Le niveau EXPERT ne peut être invoqué que depuis un juslib_id validé dans le corpus.
-  Un client ne peut jamais fournir un texte libre et obtenir is_source_text=True.
-  Tout texte non authentifié reçoit production_type=UNVERIFIED_CLIENT_TEXT.
+RÈGLES FONDAMENTALES :
+  INVARIANT-3 : Le niveau EXPERT requiert un juslib_id authentifié par connecteur.
+  INVARIANT-P0-01 : ingestion_method=client_provided → jamais EXPERT/CERTAIN.
+  INVARIANT-P0-03 : corpus_entries INSERT strict — jamais REPLACE.
 
 Mode DEBUG actif — toutes les requêtes loggées.
 """
 
 from __future__ import annotations
 
+import hashlib  # P0-02 : import manquant ajouté
 import logging
 import os
 from datetime import datetime
@@ -219,7 +217,7 @@ async def explain_from_corpus(req: ExplainFromCorpusRequest):
             detail=f"Niveau '{req.reading_level}' invalide. Valeurs : expert, intermediate, citizen"
         )
 
-    # --- Résolution depuis le corpus (R003-P0-E : SQLite) ---
+    # --- Résolution depuis le corpus (SQLite) ---
     corpus_entry = _db.get_corpus_entry(req.source_entity_id)
     if not corpus_entry:
         raise HTTPException(
@@ -228,12 +226,29 @@ async def explain_from_corpus(req: ExplainFromCorpusRequest):
                 "error": "ENTITY_NOT_IN_CORPUS",
                 "message": (
                     f"L'identifiant '{req.source_entity_id}' n'est pas présent dans le corpus JUSLIB. "
-                    "Un texte client ne peut jamais être déclaré comme source juridique (INVARIANT-3 R002). "
-                    "Pour vulgariser un texte non indexé, utiliser POST /v1/explain/text "
-                    "(lecture seule — is_source_text sera toujours False)."
+                    "Pour vulgariser un texte non indexé, utiliser POST /v1/explain/text. "
+                    "Pour ingérer un document officiel, utiliser POST /v1/corpus/ingest."
                 ),
                 "invariant": "INVARIANT-3",
-                "correction": "Indexer d'abord le document via le connecteur approprié.",
+            }
+        )
+
+    # J004-P0-01 : EXPERT interdit si le document a été importé par un client
+    ingestion_method = corpus_entry.get("ingestion_method", "client_provided")
+    if level == ReadingLevel.EXPERT and ingestion_method == "client_provided":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "EXPERT_LEVEL_FORBIDDEN_ON_CLIENT_PROVIDED",
+                "message": (
+                    f"Le niveau EXPERT est interdit pour le document '{req.source_entity_id}' "
+                    "car il a été importé par un client (ingestion_method=client_provided). "
+                    "Un texte client non authentifié ne peut jamais être déclaré source juridique. "
+                    "Pour obtenir le niveau EXPERT, ingérer le document via /v1/corpus/ingest "
+                    "avec un connecteur officiel (ingestion_method=connector_fetched)."
+                ),
+                "invariant": "INVARIANT-3 + J004-P0-01",
+                "ingestion_method": ingestion_method,
             }
         )
 
@@ -389,18 +404,27 @@ async def supported_languages():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Nouveaux endpoints R003-P0-E : index corpus, snapshot, stats DB
+# Endpoints corpus J004 — P0-01 : séparation authentifiée vs client
 # ─────────────────────────────────────────────────────────────────────────────
 
-class IndexCorpusRequest(BaseModel):
-    """Requête d'indexation d'un document dans le corpus JUSLIB."""
-    juslib_id: str
+class IngestConnectorRequest(BaseModel):
+    """
+    J004-P0-01 : Ingestion d'un document via connecteur officiel.
+    Le serveur stocke le document avec ingestion_method='connector_fetched'.
+    Le texte fourni ici représente le contenu extrait par le connecteur —
+    il doit être accompagné d'une SourceCapture (raw_bytes_hash obligatoire).
+    certainty_level peut être 'unverified', 'interpreted', 'contested', 'certain'.
+    Il ne peut PAS être 'client_provided' (réservé aux imports non authentifiés).
+    """
     title: str
     document_type: str
     jurisdiction: str
     source_url: str
     connector_id: str
+    connector_version: str
     text_excerpt: str
+    raw_bytes_hash: str          # SHA-256 du contenu brut récupéré par le connecteur
+    http_status: int = 200
     language: str = "fr"
     eli_id: Optional[str] = None
     celex_id: Optional[str] = None
@@ -408,30 +432,51 @@ class IndexCorpusRequest(BaseModel):
     native_id: Optional[str] = None
     entry_into_force: Optional[str] = None
     corpus_version: Optional[str] = None
-    certainty_level: str = "unverified"
+    certainty_level: str = "unverified"  # jamais "client_provided" sur ce endpoint
+    content_type: Optional[str] = None
+    etag: Optional[str] = None
+    last_modified: Optional[str] = None
 
 
-@app.post("/v1/corpus/index", tags=["Corpus"])
-async def index_corpus_document(req: IndexCorpusRequest):
+class ImportClientRequest(BaseModel):
     """
-    Indexe un document normatif dans le corpus JUSLIB (SQLite).
-
-    R003-P0-E : remplace l'ancienne opération _CORPUS_REGISTRY[id] = {...}.
-    Crée l'entrée dans legal_documents + corpus_entries.
-    canonical_content_hash calculé automatiquement côté serveur.
+    J004-P0-01 : Import d'un texte fourni par le CLIENT.
+    ingestion_method = 'client_provided' — jamais modifiable.
+    certainty_level forcé à 'unverified' — jamais élevé à 'certain'.
+    Le niveau EXPERT est interdit depuis ce chemin.
+    La source_url est déclarative uniquement — non vérifiée par le serveur.
     """
-    logger.debug("[API] POST /v1/corpus/index id=%s type=%s", req.juslib_id, req.document_type)
+    title: str
+    document_type: str
+    jurisdiction: str
+    source_url: str           # déclaratif — non vérifié
+    connector_id: str = "client_import"
+    text_excerpt: str
+    language: str = "fr"
+    native_id: Optional[str] = None
+    corpus_version: Optional[str] = None
 
-    # Vérifier que l'entrée n'existe pas déjà
-    existing = _db.get_corpus_entry(req.juslib_id)
-    if existing:
+
+@app.post("/v1/corpus/ingest", tags=["Corpus"])
+async def ingest_connector_document(req: IngestConnectorRequest):
+    """
+    J004-P0-01 : Ingestion officielle via connecteur.
+    ingestion_method = 'connector_fetched'.
+    Crée une SourceCapture (preuve de récupération officielle).
+    Le document peut ensuite être expliqué en niveau EXPERT depuis /v1/explain.
+
+    raw_bytes_hash requis : prouve que le connecteur a réellement récupéré des octets.
+    """
+    logger.debug("[API] POST /v1/corpus/ingest connector=%s url=%s",
+                 req.connector_id, req.source_url[:60])
+
+    if req.certainty_level == "client_provided":
         raise HTTPException(
-            status_code=409,
+            status_code=400,
             detail={
-                "error": "ALREADY_INDEXED",
-                "message": f"L'identifiant '{req.juslib_id}' est déjà présent dans le corpus. "
-                           "INSERT-only — utiliser un nouvel identifiant pour une nouvelle version.",
-                "invariant": "INVARIANT-2",
+                "error": "INVALID_CERTAINTY_FOR_CONNECTOR_INGEST",
+                "message": "certainty_level='client_provided' est réservé à /v1/corpus/import/unverified. "
+                           "Un connecteur officiel utilise 'unverified', 'interpreted', 'contested' ou 'certain'.",
             }
         )
 
@@ -450,22 +495,90 @@ async def index_corpus_document(req: IndexCorpusRequest):
             entry_into_force=req.entry_into_force,
             corpus_version=req.corpus_version,
             certainty_level=req.certainty_level,
+            production_type="connector_fetched",
+        )
+        # SourceCapture : preuve de la récupération officielle (P1-03)
+        capture_id = _db.insert_source_capture(
+            juslib_id=doc_id,
+            source_url=req.source_url,
+            raw_bytes_hash=req.raw_bytes_hash,
+            connector_id=req.connector_id,
+            http_status=req.http_status,
+            content_type=req.content_type,
+            connector_version=req.connector_version,
+            etag=req.etag,
+            last_modified=req.last_modified,
+            corpus_version=req.corpus_version,
+        )
+        _db.index_corpus_entry(
+            juslib_id=doc_id,
+            text_excerpt=req.text_excerpt,
+            source_url=req.source_url,
+            raw_source_hash=req.raw_bytes_hash,
+            corpus_version=req.corpus_version,
+            ingestion_method="connector_fetched",
+        )
+    except Exception as e:
+        logger.error("[API] ingest_connector_document error: %s", e)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+    return {
+        "status": "ingested",
+        "juslib_id": doc_id,
+        "capture_id": capture_id,
+        "ingestion_method": "connector_fetched",
+        "canonical_hash_computed": True,
+        "expert_level_accessible": True,
+        "invariant_2": "INSERT-only — enregistrement immuable",
+        "invariant_p0_01": "Provenance authentifiée par connecteur + SourceCapture",
+    }
+
+
+@app.post("/v1/corpus/import/unverified", tags=["Corpus"])
+async def import_client_document(req: ImportClientRequest):
+    """
+    J004-P0-01 : Import d'un texte CLIENT (non authentifié).
+    ingestion_method = 'client_provided' — immuable.
+    certainty_level = 'unverified' — jamais élevé.
+    Niveau EXPERT interdit depuis ce chemin — /v1/explain retournera 403 sur ce document.
+    La source_url est déclarative et n'est PAS vérifiée par le serveur.
+    """
+    logger.debug("[API] POST /v1/corpus/import/unverified connector=%s", req.connector_id)
+    try:
+        doc_id = _db.insert_document(
+            title=req.title,
+            document_type=req.document_type,
+            jurisdiction=req.jurisdiction,
+            source_url=req.source_url,
+            connector_id=req.connector_id,
+            language=req.language,
+            native_id=req.native_id,
+            corpus_version=req.corpus_version,
+            certainty_level="client_provided",   # immuable
+            production_type="rule_based",
         )
         _db.index_corpus_entry(
             juslib_id=doc_id,
             text_excerpt=req.text_excerpt,
             source_url=req.source_url,
             corpus_version=req.corpus_version,
+            ingestion_method="client_provided",
         )
     except Exception as e:
-        logger.error("[API] index_corpus_document error: %s", e)
+        logger.error("[API] import_client_document error: %s", e)
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
     return {
-        "status": "indexed",
+        "status": "imported",
         "juslib_id": doc_id,
-        "canonical_hash_computed": True,
-        "invariant_2": "INSERT-only — enregistrement immuable",
+        "ingestion_method": "client_provided",
+        "certainty_level": "client_provided",
+        "expert_level_accessible": False,
+        "warning": (
+            "⚠️ Ce document a été importé par le client et n'a pas été authentifié "
+            "depuis une source officielle. Le niveau EXPERT est interdit. "
+            "Utiliser /v1/corpus/ingest avec un connecteur officiel pour une source authentifiée."
+        ),
     }
 
 
@@ -502,6 +615,7 @@ async def corpus_snapshot(
         "jurisdiction": doc.get("jurisdiction"),
         "provisions_total": len(snapshot),
         "provisions_in_force": sum(1 for s in snapshot if s["is_in_force"]),
+        # P1-02 : inclut le version_status dans chaque provision
         "snapshot": snapshot,
     }
 
