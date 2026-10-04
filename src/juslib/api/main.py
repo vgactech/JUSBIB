@@ -2,17 +2,33 @@
 JUSLIB — FastAPI REST API v1.
 
 J004 :
-  P0-01 : /v1/corpus/index fermé — un texte client ne peut plus devenir source authentifiée.
-           Le nouveau endpoint /v1/corpus/ingest requiert un appel connecteur réel.
-  P0-02 : import hashlib ajouté (NameError sur /v1/explain corrigé).
-  Mise à jour version 0.1.3.
+  P0-01 : /v1/corpus/ingest séparé de /v1/corpus/import/unverified.
+  P0-02 : import hashlib ajouté.
+
+J006 (P0 MVP) :
+  P0-C : /v1/search — FTS5 SQLite réel (plus de stub vide).
+  P0-D : DB persistante par défaut data/juslib.db (JUSLIB_DB_PATH=:memory: pour les tests).
+  P0-E : Ingestion transactionnelle atomique (BEGIN → document+capture+corpus → COMMIT/ROLLBACK).
+  P0-F : Endpoints CRUD :
+           POST /v1/document            — créer un document
+           GET  /v1/document/{id}       — consulter un document
+           POST /v1/provision           — créer une disposition
+           POST /v1/version             — créer une version temporelle
+           POST /v1/relation            — créer une relation entre documents
+           GET  /v1/diff/{from}/{to}    — diff déterministe entre deux versions
+           GET  /v1/releases            — liste des releases corpus
+           POST /v1/releases            — créer une release
+           GET  /v1/authority           — liste des autorités
+           POST /v1/authority           — créer une autorité
 
 RÈGLES FONDAMENTALES :
   INVARIANT-3 : Le niveau EXPERT requiert un juslib_id authentifié par connecteur.
   INVARIANT-P0-01 : ingestion_method=client_provided → jamais EXPERT/CERTAIN.
   INVARIANT-P0-03 : corpus_entries INSERT strict — jamais REPLACE.
+  INVARIANT-P0-E : Toute ingestion officielle est atomique — pas de document sans capture.
 
 Mode DEBUG actif — toutes les requêtes loggées.
+CERTIFIED_100=false | unique_human_proven=false
 """
 
 from __future__ import annotations
@@ -32,10 +48,16 @@ from juslib.translation.plain_language import PlainLanguageEngine, ReadingLevel
 from juslib.translation.multilingual import EU_LANGUAGES, UN_LANGUAGES, ALL_SUPPORTED_LANGUAGES
 from juslib.versioning.corpus_tracker import CorpusTracker
 
-# R003-P0-E : remplace le dict _CORPUS_REGISTRY par SQLite avec FK réelles
-# Chemin configurable via JUSLIB_DB_PATH (défaut : :memory: pour compatibilité tests)
+# P0-D J006 : DB persistante par défaut data/juslib.db
+# Tests : passer JUSLIB_DB_PATH=:memory: dans l'environnement
+_DEFAULT_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "data", "juslib.db"
+)
+_db_path_env = os.getenv("JUSLIB_DB_PATH")
+_db_path = _db_path_env if _db_path_env is not None else _DEFAULT_DB_PATH
 _db = JuslibDB(
-    db_path=os.getenv("JUSLIB_DB_PATH"),  # None → :memory:
+    db_path=_db_path,
     debug=(os.getenv("JUSLIB_DEBUG", "true").lower() != "false"),
 )
 
@@ -163,16 +185,18 @@ async def corpus_versions():
 @app.post("/v1/search", tags=["Search"])
 async def search(req: SearchRequest):
     """
-    Recherche dans les sources officielles JUSLIB.
+    Recherche full-text dans le corpus JUSLIB via SQLite FTS5.
+
+    J006-P0-C : moteur FTS5 réel — plus de stub vide.
 
     Paramètres :
-      - query : terme(s) de recherche
+      - query : terme(s) de recherche (AND, OR, NOT, "phrase exacte" supportés)
       - language : code BCP-47 (fr, en, de, es, it, nl, pt, pl…)
       - jurisdiction : EU, FR, CA, INT, OHADA…
-      - document_type : regulation, directive, law, jurisprudence…
-      - sources : filtrer par connecteur (eurlex, legifrance, echr…)
+      - max_results : 1–100 (défaut 20)
     """
-    logger.debug("[API] POST /v1/search query=%s lang=%s", req.query[:50], req.language)
+    logger.debug("[API] POST /v1/search query=%s lang=%s juris=%s",
+                 req.query[:50], req.language, req.jurisdiction)
 
     if req.language not in ALL_SUPPORTED_LANGUAGES:
         raise HTTPException(
@@ -181,17 +205,23 @@ async def search(req: SearchRequest):
                    f"Langues disponibles : {sorted(ALL_SUPPORTED_LANGUAGES)[:10]}…"
         )
 
-    # NOTE : La recherche full-text est implémentée en Phase 7 (moteur Typesense/SQLite FTS)
-    # Ce endpoint retourne la structure de réponse normalisée
+    limit = min(max(1, req.max_results), 100)
+    results = _db.search_versions_fts(
+        query=req.query,
+        language=req.language if req.language != "all" else None,
+        jurisdiction=req.jurisdiction,
+        limit=limit,
+    )
+
     return {
         "query": req.query,
         "language": req.language,
         "jurisdiction": req.jurisdiction,
-        "results": [],
-        "total": 0,
-        "note": "Moteur de recherche full-text — Phase 7 (V0.2). "
-                "Utiliser les connecteurs directement pour l'instant.",
-        "invariant_1": "Chaque résultat contiendra source_url + source_hash obligatoires",
+        "results": results,
+        "total": len(results),
+        "engine": "sqlite_fts5",
+        "invariant_1": "Chaque résultat contient source identifiable via version_id",
+        "certified_100": False,
     }
 
 
@@ -460,12 +490,11 @@ class ImportClientRequest(BaseModel):
 @app.post("/v1/corpus/ingest", tags=["Corpus"])
 async def ingest_connector_document(req: IngestConnectorRequest):
     """
-    J004-P0-01 : Ingestion officielle via connecteur.
-    ingestion_method = 'connector_fetched'.
-    Crée une SourceCapture (preuve de récupération officielle).
-    Le document peut ensuite être expliqué en niveau EXPERT depuis /v1/explain.
+    J004-P0-01 + J006-P0-E : Ingestion officielle via connecteur — ATOMIQUE.
 
-    raw_bytes_hash requis : prouve que le connecteur a réellement récupéré des octets.
+    Transaction unique : document + capture + corpus_entry dans un seul BEGIN/COMMIT.
+    Si l'une des 3 opérations échoue → ROLLBACK complet.
+    Aucun document ne peut exister sans sa SourceCapture associée.
     """
     logger.debug("[API] POST /v1/corpus/ingest connector=%s url=%s",
                  req.connector_id, req.source_url[:60])
@@ -480,47 +509,52 @@ async def ingest_connector_document(req: IngestConnectorRequest):
             }
         )
 
+    # P0-E J006 : transaction atomique — document + capture + corpus en un seul COMMIT
+    import uuid as _uuid_mod
+    import unicodedata as _uni_mod
+    import re as _re_mod
+    doc_id = f"doc:{_uuid_mod.uuid4().hex[:16]}"
+    capture_id = f"cap:{_uuid_mod.uuid4().hex[:16]}"
     try:
-        doc_id = _db.insert_document(
-            title=req.title,
-            document_type=req.document_type,
-            jurisdiction=req.jurisdiction,
-            source_url=req.source_url,
-            connector_id=req.connector_id,
-            language=req.language,
-            eli_id=req.eli_id,
-            celex_id=req.celex_id,
-            ecli_id=req.ecli_id,
-            native_id=req.native_id,
-            entry_into_force=req.entry_into_force,
-            corpus_version=req.corpus_version,
-            certainty_level=req.certainty_level,
-            production_type="connector_fetched",
-        )
-        # SourceCapture : preuve de la récupération officielle (P1-03)
-        capture_id = _db.insert_source_capture(
-            juslib_id=doc_id,
-            source_url=req.source_url,
-            raw_bytes_hash=req.raw_bytes_hash,
-            connector_id=req.connector_id,
-            http_status=req.http_status,
-            content_type=req.content_type,
-            connector_version=req.connector_version,
-            etag=req.etag,
-            last_modified=req.last_modified,
-            corpus_version=req.corpus_version,
-        )
-        _db.index_corpus_entry(
-            juslib_id=doc_id,
-            text_excerpt=req.text_excerpt,
-            source_url=req.source_url,
-            raw_source_hash=req.raw_bytes_hash,
-            corpus_version=req.corpus_version,
-            ingestion_method="connector_fetched",
-        )
+        with _db.conn() as con:
+            _norm = _uni_mod.normalize("NFC", req.text_excerpt)
+            _norm = _re_mod.sub(r"\s+", " ", _norm).strip()
+            canonical_hash = hashlib.sha256(_norm.encode("utf-8")).hexdigest()
+
+            con.execute(
+                """INSERT INTO legal_documents
+                    (juslib_id, title, document_type, jurisdiction, language,
+                     eli_id, celex_id, ecli_id, native_id, entry_into_force,
+                     source_url, connector_id, raw_source_hash, canonical_content_hash,
+                     corpus_version, certainty_level, production_type)
+                   VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?)""",
+                (doc_id, req.title, req.document_type, req.jurisdiction, req.language,
+                 req.eli_id, req.celex_id, req.ecli_id, req.native_id, req.entry_into_force,
+                 req.source_url, req.connector_id, req.raw_bytes_hash, canonical_hash,
+                 req.corpus_version, req.certainty_level, "connector_fetched"),
+            )
+            con.execute(
+                """INSERT INTO source_captures
+                    (capture_id, juslib_id, source_url, http_status, content_type,
+                     raw_bytes_hash, connector_id, connector_version,
+                     etag, last_modified, corpus_version, retrieval_timestamp)
+                   VALUES (?,?,?,?,?, ?,?,?, ?,?,?,datetime('now'))""",
+                (capture_id, doc_id, req.source_url, req.http_status, req.content_type,
+                 req.raw_bytes_hash, req.connector_id, req.connector_version,
+                 req.etag, req.last_modified, req.corpus_version),
+            )
+            con.execute(
+                """INSERT INTO corpus_entries
+                    (juslib_id, text_excerpt, raw_source_hash, canonical_content_hash,
+                     source_url, ingestion_method, corpus_version)
+                   VALUES (?,?,?,?, ?,?,?)""",
+                (doc_id, req.text_excerpt, req.raw_bytes_hash, canonical_hash,
+                 req.source_url, "connector_fetched", req.corpus_version),
+            )
+        logger.debug("[API] ingest atomic OK doc=%s cap=%s", doc_id, capture_id)
     except Exception as e:
-        logger.error("[API] ingest_connector_document error: %s", e)
-        raise HTTPException(status_code=500, detail={"error": str(e)})
+        logger.error("[API] ingest_connector_document ROLLBACK: %s", e)
+        raise HTTPException(status_code=500, detail={"error": str(e), "rollback": True})
 
     return {
         "status": "ingested",
@@ -528,6 +562,7 @@ async def ingest_connector_document(req: IngestConnectorRequest):
         "capture_id": capture_id,
         "ingestion_method": "connector_fetched",
         "canonical_hash_computed": True,
+        "atomic_transaction": True,
         "expert_level_accessible": True,
         "invariant_2": "INSERT-only — enregistrement immuable",
         "invariant_p0_01": "Provenance authentifiée par connecteur + SourceCapture",
@@ -625,3 +660,341 @@ async def db_stats():
     """Statistiques de la base de données JUSLIB."""
     logger.debug("[API] GET /v1/db/stats")
     return _db.stats()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# J006 P0-F : Endpoints CRUD — document / provision / version / relation / diff
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DocumentCreateRequest(BaseModel):
+    """Création d'un document juridique (ingestion non-officielle ou opérateur)."""
+    title: str
+    document_type: str
+    jurisdiction: str
+    source_url: str
+    connector_id: str
+    language: str = "fr"
+    eli_id: Optional[str] = None
+    celex_id: Optional[str] = None
+    ecli_id: Optional[str] = None
+    native_id: Optional[str] = None
+    entry_into_force: Optional[str] = None
+    corpus_version: Optional[str] = None
+    certainty_level: str = "unverified"
+    production_type: str = "rule_based"
+
+
+@app.post("/v1/document", status_code=201, tags=["Document"])
+async def create_document(req: DocumentCreateRequest):
+    """
+    J006-P0-F : Créer un document juridique dans le corpus.
+    Pour une ingestion authentifiée avec SourceCapture, utiliser /v1/corpus/ingest.
+    """
+    logger.debug("[API] POST /v1/document title=%s juris=%s", req.title[:40], req.jurisdiction)
+    try:
+        doc_id = _db.insert_document(
+            title=req.title,
+            document_type=req.document_type,
+            jurisdiction=req.jurisdiction,
+            source_url=req.source_url,
+            connector_id=req.connector_id,
+            language=req.language,
+            eli_id=req.eli_id,
+            celex_id=req.celex_id,
+            ecli_id=req.ecli_id,
+            native_id=req.native_id,
+            entry_into_force=req.entry_into_force,
+            corpus_version=req.corpus_version,
+            certainty_level=req.certainty_level,
+            production_type=req.production_type,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+    return {"juslib_id": doc_id, "status": "created"}
+
+
+@app.get("/v1/document/{document_id}", tags=["Document"])
+async def get_document(document_id: str):
+    """J006-P0-F : Consulter un document juridique par son ID JUSLIB."""
+    logger.debug("[API] GET /v1/document/%s", document_id)
+    doc = _db.get_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document '{document_id}' non trouvé.")
+    return doc
+
+
+class ProvisionCreateRequest(BaseModel):
+    """Création d'une disposition (article, alinéa…)."""
+    document_id: str
+    number: Optional[str] = None
+    label: Optional[str] = None
+    heading: Optional[str] = None
+    language: str = "fr"
+    order_index: int = 0
+    corpus_version: Optional[str] = None
+
+
+@app.post("/v1/provision", status_code=201, tags=["Document"])
+async def create_provision(req: ProvisionCreateRequest):
+    """J006-P0-F : Créer une disposition dans un document existant."""
+    logger.debug("[API] POST /v1/provision doc=%s num=%s", req.document_id, req.number)
+    if not _db.get_document(req.document_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document '{req.document_id}' non trouvé — créer le document d'abord."
+        )
+    try:
+        prov_id = _db.insert_provision(
+            document_id=req.document_id,
+            number=req.number,
+            label=req.label,
+            heading=req.heading,
+            language=req.language,
+            order_index=req.order_index,
+            corpus_version=req.corpus_version,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+    return {"provision_id": prov_id, "status": "created"}
+
+
+class VersionCreateRequest(BaseModel):
+    """Création d'une version temporelle d'une disposition."""
+    provision_id: str
+    document_id: str
+    text: str
+    source_url: str
+    valid_from: str
+    valid_until: Optional[str] = None
+    language: str = "fr"
+    version_status: str = "in_force"
+    change_type: str = "initial"
+    connector_id: Optional[str] = None
+    certainty_level: str = "unverified"
+    production_type: str = "rule_based"
+    allow_overlap: bool = False
+
+
+@app.post("/v1/version", status_code=201, tags=["Document"])
+async def create_version(req: VersionCreateRequest):
+    """
+    J006-P0-F : Créer une version temporelle d'une disposition.
+    Le chevauchement temporel est rejeté sauf si allow_overlap=True.
+    La version est indexée automatiquement dans FTS5.
+    """
+    logger.debug("[API] POST /v1/version prov=%s from=%s", req.provision_id, req.valid_from)
+    try:
+        ver_id = _db.insert_version(
+            provision_id=req.provision_id,
+            document_id=req.document_id,
+            text=req.text,
+            source_url=req.source_url,
+            valid_from=req.valid_from,
+            valid_until=req.valid_until,
+            language=req.language,
+            version_status=req.version_status,
+            change_type=req.change_type,
+            connector_id=req.connector_id,
+            certainty_level=req.certainty_level,
+            production_type=req.production_type,
+            allow_overlap=req.allow_overlap,
+        )
+    except Exception as e:
+        status = 409 if "chevauchement" in str(e).lower() or "overlap" in str(e).lower() else 500
+        raise HTTPException(status_code=status, detail={"error": str(e)})
+    return {"version_id": ver_id, "status": "created", "fts5_indexed": True}
+
+
+class RelationCreateRequest(BaseModel):
+    """Création d'une relation juridique entre deux documents."""
+    relation_type: str          # AMENDS, REPEALS, IMPLEMENTS, INTERPRETS, OVERRULES, CITES…
+    source_id: str              # ID du document source
+    target_id: str              # ID du document cible
+    evidence_url: str           # URL de la preuve
+    evidence_text: Optional[str] = None
+    confidence: float = 0.0
+    certainty_level: str = "unverified"
+    production_type: str = "rule_based"
+
+
+@app.post("/v1/relation", status_code=201, tags=["Graph"])
+async def create_relation(req: RelationCreateRequest):
+    """
+    J006-P0-F : Créer une relation juridique entre deux documents.
+    Types supportés : AMENDS, REPEALS, IMPLEMENTS, INTERPRETS, OVERRULES, CITES,
+                      TRANSPOSES, SUPPLEMENTS, ANNULS, CONFIRMS.
+    """
+    logger.debug("[API] POST /v1/relation type=%s src=%s tgt=%s",
+                 req.relation_type, req.source_id[:12], req.target_id[:12])
+    try:
+        ev_id = _db.insert_relation_evidence(
+            relation_type=req.relation_type,
+            source_id=req.source_id,
+            target_id=req.target_id,
+            evidence_url=req.evidence_url,
+            evidence_text=req.evidence_text,
+            confidence=req.confidence,
+            certainty_level=req.certainty_level,
+            production_type=req.production_type,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+    return {"evidence_id": ev_id, "status": "created"}
+
+
+@app.get("/v1/diff/{from_version_id}/{to_version_id}", tags=["Document"])
+async def diff_versions(from_version_id: str, to_version_id: str):
+    """
+    J006-P0-F : Diff déterministe entre deux versions d'une disposition.
+
+    Retourne :
+      - texte supprimé (marqué -)
+      - texte ajouté (marqué +)
+      - hash avant / hash après
+      - dates de validité
+      - source de chaque version
+
+    Le diff est basé sur difflib (ligne par ligne) — déterministe et reproductible.
+    Chaque diff est auditable via les hashes canoniques.
+    """
+    import difflib as _diff
+    logger.debug("[API] GET /v1/diff/%s → %s", from_version_id[:12], to_version_id[:12])
+
+    with _db.conn() as con:
+        v_from = con.execute(
+            "SELECT * FROM legal_versions WHERE version_id = ?", (from_version_id,)
+        ).fetchone()
+        v_to = con.execute(
+            "SELECT * FROM legal_versions WHERE version_id = ?", (to_version_id,)
+        ).fetchone()
+
+    if not v_from:
+        raise HTTPException(status_code=404,
+                            detail=f"Version '{from_version_id}' non trouvée.")
+    if not v_to:
+        raise HTTPException(status_code=404,
+                            detail=f"Version '{to_version_id}' non trouvée.")
+
+    v_from = dict(v_from)
+    v_to = dict(v_to)
+
+    text_from = v_from["text"]
+    text_to = v_to["text"]
+
+    lines_from = text_from.splitlines(keepends=True)
+    lines_to = text_to.splitlines(keepends=True)
+
+    unified = list(_diff.unified_diff(
+        lines_from, lines_to,
+        fromfile=f"v={from_version_id} ({v_from.get('valid_from','?')})",
+        tofile=f"v={to_version_id} ({v_to.get('valid_from','?')})",
+        lineterm="",
+    ))
+
+    added = sum(1 for l in unified if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in unified if l.startswith("-") and not l.startswith("---"))
+
+    return {
+        "from_version_id": from_version_id,
+        "to_version_id": to_version_id,
+        "from_valid_from": v_from.get("valid_from"),
+        "to_valid_from": v_to.get("valid_from"),
+        "from_canonical_hash": v_from.get("canonical_content_hash"),
+        "to_canonical_hash": v_to.get("canonical_content_hash"),
+        "from_source_url": v_from.get("source_url"),
+        "to_source_url": v_to.get("source_url"),
+        "lines_added": added,
+        "lines_removed": removed,
+        "unchanged": text_from == text_to,
+        "diff_unified": unified,
+        "diff_engine": "difflib.unified_diff",
+        "deterministic": True,
+        "invariant_2": "Les versions sont immuables — le diff est toujours reproductible",
+    }
+
+
+# ─── Releases corpus ───────────────────────────────────────────────────────
+
+class ReleaseCreateRequest(BaseModel):
+    label: str              # ex: 2026.10.04-001
+    release_date: str       # YYYY-MM-DD
+    corpus_version: str
+    manifest_hash: str      # SHA-256 du manifest JSON
+    description: Optional[str] = None
+    documents_count: int = 0
+    provisions_count: int = 0
+    versions_count: int = 0
+    published_by: Optional[str] = None
+
+
+@app.get("/v1/releases", tags=["Corpus"])
+async def list_releases():
+    """J006-P0-A : Liste les releases immuables du corpus."""
+    logger.debug("[API] GET /v1/releases")
+    releases = _db.get_corpus_releases()
+    latest = _db.get_latest_corpus_release()
+    return {
+        "total": len(releases),
+        "latest": latest,
+        "releases": releases,
+        "invariant": "INSERT-only — releases immuables",
+    }
+
+
+@app.post("/v1/releases", status_code=201, tags=["Corpus"])
+async def create_release(req: ReleaseCreateRequest):
+    """J006-P0-A : Créer une release immuable du corpus."""
+    logger.debug("[API] POST /v1/releases label=%s", req.label)
+    try:
+        rel_id = _db.insert_corpus_release(
+            label=req.label,
+            release_date=req.release_date,
+            manifest_hash=req.manifest_hash,
+            corpus_version=req.corpus_version,
+            description=req.description,
+            documents_count=req.documents_count,
+            provisions_count=req.provisions_count,
+            versions_count=req.versions_count,
+            published_by=req.published_by,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+    return {"release_id": rel_id, "label": req.label, "status": "created"}
+
+
+# ─── Autorités ─────────────────────────────────────────────────────────────
+
+class AuthorityCreateRequest(BaseModel):
+    short_name: str
+    full_name: str
+    jurisdiction: str
+    authority_type: str     # LEGISLATURE, COURT, EXECUTIVE, TREATY_BODY, INTERNATIONAL…
+    language: str = "fr"
+    official_url: Optional[str] = None
+
+
+@app.get("/v1/authority", tags=["Authority"])
+async def list_authorities(
+    jurisdiction: Optional[str] = Query(default=None, description="Filtre par juridiction")
+):
+    """J006-P0-B : Liste les autorités juridictionnelles."""
+    logger.debug("[API] GET /v1/authority juris=%s", jurisdiction)
+    return {"authorities": _db.get_all_authorities(jurisdiction=jurisdiction)}
+
+
+@app.post("/v1/authority", status_code=201, tags=["Authority"])
+async def create_authority(req: AuthorityCreateRequest):
+    """J006-P0-B : Créer une autorité juridictionnelle."""
+    logger.debug("[API] POST /v1/authority short_name=%s", req.short_name)
+    try:
+        auth_id = _db.insert_authority(
+            short_name=req.short_name,
+            full_name=req.full_name,
+            jurisdiction=req.jurisdiction,
+            authority_type=req.authority_type,
+            language=req.language,
+            official_url=req.official_url,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+    return {"authority_id": auth_id, "status": "created"}

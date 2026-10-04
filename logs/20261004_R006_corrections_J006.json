@@ -1,0 +1,42 @@
+{
+  "timestamp": "2026-10-04T00:00:00Z",
+  "session": "J006",
+  "pytest_run": {
+    "total": 230,
+    "passed": 230,
+    "failed": 0,
+    "errors": 0,
+    "result": "ALL_PASS"
+  },
+  "test_files": {
+    "test_juslib_core.py": "69 blocs A-G",
+    "test_juslib_j004.py": "55 blocs O-X (dont R07 mis à jour : 9→10 tables)",
+    "test_juslib_j006.py": "57 blocs AA-AJ (NOUVEAU)",
+    "test_juslib_r003.py": "49 blocs H-N"
+  },
+  "corrections_j006": {
+    "P0-A": "table corpus_releases + CRUD + triggers INSERT-only",
+    "P0-B": "insert_authority/get_authority/get_all_authorities + /v1/authority",
+    "P0-C": "FTS5 SQLite sur legal_versions + search_versions_fts() + /v1/search réel",
+    "P0-D": "DB persistante par défaut data/juslib.db (plus :memory: en prod)",
+    "P0-E": "Ingestion transactionnelle atomique BEGIN/COMMIT/ROLLBACK",
+    "P0-F": "/v1/document POST+GET + /v1/provision POST + /v1/version POST + /v1/relation POST + /v1/diff GET",
+    "P0-G": "version 0.2.0 sync __init__.py + pyproject.toml",
+    "P0-H": ".github/workflows/ci.yml créé"
+  },
+  "endpoints_added": [
+    "POST /v1/document",
+    "GET /v1/document/{id}",
+    "POST /v1/provision",
+    "POST /v1/version",
+    "POST /v1/relation",
+    "GET /v1/diff/{from}/{to}",
+    "GET /v1/releases",
+    "POST /v1/releases",
+    "GET /v1/authority",
+    "POST /v1/authority"
+  ],
+  "version": "0.2.0",
+  "certified_100": false,
+  "unique_human_proven": false
+}

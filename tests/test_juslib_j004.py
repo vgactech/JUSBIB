@@ -293,10 +293,11 @@ class TestInsertOnlyAllTables:
                             "WHERE capture_id = ?", (cap_id,))
 
     def test_R07_stats_reports_9_tables_with_insert_only(self, db):
-        """R07 : stats() déclare 9 tables avec triggers INSERT-only."""
+        """R07 : stats() déclare 10 tables avec triggers INSERT-only (J006 : +corpus_releases)."""
         s = db.stats()
-        assert s["tables_with_insert_only_triggers"] == 9, (
-            f"Attendu 9 tables INSERT-only, obtenu {s['tables_with_insert_only_triggers']}"
+        assert s["tables_with_insert_only_triggers"] == 10, (
+            f"Attendu 10 tables INSERT-only (J006 ajout corpus_releases), "
+            f"obtenu {s['tables_with_insert_only_triggers']}"
         )
 
 
