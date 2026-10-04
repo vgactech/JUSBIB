@@ -1,0 +1,43 @@
+# JUSLIB — .gitignore
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Base de données locale
+data/juslib.db
+data/juslib_*.db
+
+# Corpus (données brutes — trop volumineuses pour Git)
+# Les releases sont trackées via JSONL + tags Git
+data/corpus/raw/
+data/corpus/cache/
+
+# Logs
+logs/*.jsonl
+logs/*.log
+logs/*.txt
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
