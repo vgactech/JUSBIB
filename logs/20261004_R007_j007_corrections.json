@@ -1,0 +1,21 @@
+{
+  "session": "J007",
+  "timestamp": "2026-10-04T00:00:00Z",
+  "tests_total": 39,
+  "tests_passed": 39,
+  "tests_failed": 0,
+  "status": "PASS",
+  "corrections": [
+    {
+      "id": "AN01",
+      "fix": "ci.yml step name renommé: suppression de || true dans le libellé"
+    },
+    {
+      "id": "AM10",
+      "fix": "compute_snapshot() enrichi: version_id ajouté au niveau racine de chaque entrée snapshot"
+    }
+  ],
+  "certified_100": false,
+  "unique_human_proven": false,
+  "debug_mode": true
+}

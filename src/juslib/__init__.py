@@ -33,7 +33,7 @@ R006-J006 : Corrections audit J005 (P0 MVP).
   P0-H  : CI GitHub Actions workflow (.github/workflows/ci.yml)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __project__ = "JUSLIB"
 __description__ = "Sovereign Multilingual Legal Library — European and International Level"
 DEBUG_MODE = True

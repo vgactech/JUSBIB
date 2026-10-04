@@ -677,31 +677,31 @@ class TestReleasesAndAuthoritiesAPI:
 # ============================================================
 
 class TestVersionSync:
-    """AH — Synchronisation version 0.2.0."""
+    """AH — Synchronisation version 0.3.0."""
 
     def test_AH01_init_version_is_0_2_0(self):
-        """AH01 : __version__ == '0.2.0'."""
+        """AH01 : __version__ == '0.3.0'."""
         from juslib import __version__
-        assert __version__ == "0.2.0", f"Attendu 0.2.0, obtenu {__version__}"
+        assert __version__ == "0.3.0", f"Attendu 0.3.0, obtenu {__version__}"
 
     def test_AH02_pyproject_version_is_0_2_0(self):
-        """AH02 : pyproject.toml déclare version 0.2.0."""
+        """AH02 : pyproject.toml déclare version 0.3.0."""
         pyproject_path = os.path.join(
             os.path.dirname(__file__), "..", "pyproject.toml"
         )
         with open(pyproject_path) as f:
             content = f.read()
-        assert 'version = "0.2.0"' in content, (
-            "pyproject.toml ne déclare pas version = '0.2.0'"
+        assert 'version = "0.3.0"' in content, (
+            "pyproject.toml ne déclare pas version = '0.3.0'"
         )
 
     def test_AH03_health_returns_0_2_0(self):
-        """AH03 : GET /v1/health retourne version 0.2.0."""
+        """AH03 : GET /v1/health retourne version 0.3.0."""
         from fastapi.testclient import TestClient
         from juslib.api.main import app
         client = TestClient(app)
         resp = client.get("/v1/health")
-        assert resp.json()["version"] == "0.2.0"
+        assert resp.json()["version"] == "0.3.0"
 
 
 # ============================================================

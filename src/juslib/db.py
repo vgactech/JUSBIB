@@ -312,18 +312,27 @@ END;
 -- Table 7 : Traductions vérifiées (P0-04 : triggers ajoutés)
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS translation_records (
-    translation_id    TEXT PRIMARY KEY,
-    version_id        TEXT NOT NULL REFERENCES legal_versions(version_id),
-    source_language   TEXT NOT NULL,
-    target_language   TEXT NOT NULL,
-    translated_text   TEXT NOT NULL,
-    translation_type  TEXT NOT NULL DEFAULT 'official',
-    source_url        TEXT,
-    translator        TEXT,
-    canonical_hash    TEXT,
-    certainty_level   TEXT NOT NULL DEFAULT 'unverified',
-    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-    CONSTRAINT chk_trans_type CHECK (translation_type IN ('official','machine','human_reviewed'))
+    translation_id         TEXT PRIMARY KEY,
+    version_id             TEXT NOT NULL REFERENCES legal_versions(version_id),
+    source_language        TEXT NOT NULL,
+    target_language        TEXT NOT NULL,
+    translated_text        TEXT NOT NULL,
+    translation_type       TEXT NOT NULL DEFAULT 'official',
+    -- Lien cryptographique : hash canonique du texte source dans legal_versions
+    source_version_hash    TEXT,
+    source_url             TEXT,
+    translator             TEXT,
+    canonical_hash         TEXT,     -- hash canonique du texte traduit
+    -- Distinction IA / rule-based / officiel
+    production_type        TEXT NOT NULL DEFAULT 'rule_based',
+    certainty_level        TEXT NOT NULL DEFAULT 'unverified',
+    -- Invariant : une traduction ne peut jamais devenir source normative
+    is_normative_source    INTEGER NOT NULL DEFAULT 0 CHECK (is_normative_source = 0),
+    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT chk_trans_type CHECK (translation_type IN ('official','machine','human_reviewed')),
+    CONSTRAINT chk_prod_type CHECK (
+        production_type IN ('rule_based','llm_generated','human_validated','connector_fetched')
+    )
 );
 
 CREATE TRIGGER IF NOT EXISTS trg_no_update_translation_records
@@ -854,13 +863,16 @@ class JuslibDB:
                         )
                     except Exception:
                         pass  # snapshot déjà enregistré — INSERT-only, pas d'erreur
-            results.append({
+            entry: dict[str, Any] = {
                 "provision": dict(prov),
                 "version": version,
                 "is_in_force": bool(is_in_force),
                 "version_status": status_info["status"],
                 "snapshot_date": on_date,
-            })
+            }
+            if version:
+                entry["version_id"] = version["version_id"]
+            results.append(entry)
         return results
 
     # ─────────────────────────────────────────────────────────────────
@@ -1033,7 +1045,31 @@ class JuslibDB:
         source_url: Optional[str] = None,
         translator: Optional[str] = None,
         certainty_level: str = "unverified",
+        production_type: str = "rule_based",
     ) -> str:
+        """
+        Insère un TranslationRecord relié à une LegalVersion précise.
+
+        C15 J007 :
+        - source_version_hash : hash canonique du texte source (récupéré automatiquement)
+          → lien cryptographique inviolable entre la traduction et sa version source
+        - production_type : jamais 'source' — une traduction est toujours dérivée
+        - is_normative_source = 0 : invariant — une traduction ≠ source normative
+        """
+        # Récupérer le hash canonique de la version source
+        source_version_hash: Optional[str] = None
+        with self.conn() as con:
+            row = con.execute(
+                "SELECT canonical_content_hash FROM legal_versions WHERE version_id = ?",
+                (version_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError(
+                    f"version_id '{version_id}' introuvable dans legal_versions. "
+                    "Créer la version juridique avant d'y attacher une traduction."
+                )
+            source_version_hash = row[0]
+
         translation_id = str(uuid.uuid4())
         canonical_hash = _compute_canonical_hash(translated_text)
         with self.conn() as con:
@@ -1041,15 +1077,73 @@ class JuslibDB:
                 """
                 INSERT INTO translation_records (
                     translation_id, version_id, source_language, target_language,
-                    translated_text, translation_type, source_url, translator,
-                    canonical_hash, certainty_level
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    translated_text, translation_type, source_version_hash,
+                    source_url, translator, canonical_hash,
+                    production_type, certainty_level
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (translation_id, version_id, source_language, target_language,
-                 translated_text, translation_type, source_url, translator,
-                 canonical_hash, certainty_level),
+                 translated_text, translation_type, source_version_hash,
+                 source_url, translator, canonical_hash,
+                 production_type, certainty_level),
             )
+        logger.debug(
+            "[DB] insert_translation id=%s version=%s %s→%s",
+            translation_id, version_id, source_language, target_language
+        )
         return translation_id
+
+    def get_translation(self, translation_id: str) -> Optional[dict[str, Any]]:
+        """Retourne un TranslationRecord par son ID."""
+        with self.conn() as con:
+            row = con.execute(
+                "SELECT * FROM translation_records WHERE translation_id = ?",
+                (translation_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_translations_for_version(self, version_id: str) -> list[dict[str, Any]]:
+        """Retourne toutes les traductions d'une version juridique."""
+        with self.conn() as con:
+            rows = con.execute(
+                "SELECT * FROM translation_records WHERE version_id = ? ORDER BY target_language",
+                (version_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def verify_translation_integrity(self, translation_id: str) -> tuple[bool, list[str]]:
+        """
+        Vérifie l'intégrité d'un TranslationRecord :
+        1. hash canonique du texte traduit correspond au canonical_hash stocké
+        2. source_version_hash correspond au hash canonique de la version source actuelle
+        """
+        errors: list[str] = []
+        t = self.get_translation(translation_id)
+        if not t:
+            return False, [f"TranslationRecord '{translation_id}' introuvable"]
+
+        # Vérif 1 : hash du texte traduit
+        computed_hash = _compute_canonical_hash(t["translated_text"])
+        if t.get("canonical_hash") and computed_hash != t["canonical_hash"]:
+            errors.append(
+                f"HASH_MISMATCH: canonical_hash stocké={t['canonical_hash'][:12]} "
+                f"calculé={computed_hash[:12]}"
+            )
+
+        # Vérif 2 : source_version_hash == hash canonique de la version source
+        with self.conn() as con:
+            row = con.execute(
+                "SELECT canonical_content_hash FROM legal_versions WHERE version_id = ?",
+                (t["version_id"],)
+            ).fetchone()
+        if row and t.get("source_version_hash"):
+            if row[0] != t["source_version_hash"]:
+                errors.append(
+                    f"SOURCE_HASH_MISMATCH: source_version_hash stocké={t['source_version_hash'][:12]} "
+                    f"version actuelle={row[0][:12] if row[0] else 'None'}"
+                )
+
+        return len(errors) == 0, errors
 
     # ─────────────────────────────────────────────────────────────────
     # Statistiques

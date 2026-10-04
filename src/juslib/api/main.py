@@ -998,3 +998,114 @@ async def create_authority(req: AuthorityCreateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": str(e)})
     return {"authority_id": auth_id, "status": "created"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# J007 C15 : Endpoint /v1/translation — TranslationRecord versionnée
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TranslationCreateRequest(BaseModel):
+    """
+    C15 J007 : Création d'un TranslationRecord relié à une LegalVersion.
+
+    Invariants :
+    - version_id doit exister dans legal_versions
+    - source_version_hash est calculé automatiquement côté serveur (non fourni par le client)
+    - is_normative_source = 0 TOUJOURS — une traduction n'est jamais une source normative
+    - production_type ne peut pas être 'source'
+    """
+    version_id: str
+    source_language: str
+    target_language: str
+    translated_text: str
+    translation_type: str = "official"       # official | machine | human_reviewed
+    source_url: Optional[str] = None
+    translator: Optional[str] = None
+    certainty_level: str = "unverified"
+    production_type: str = "rule_based"      # jamais 'source'
+
+    @field_validator("production_type")
+    @classmethod
+    def production_type_not_source(cls, v: str) -> str:
+        if v == "source":
+            raise ValueError(
+                "production_type='source' interdit sur une traduction. "
+                "Une traduction est toujours dérivée, jamais une source normative."
+            )
+        return v
+
+
+@app.post("/v1/translation", status_code=201, tags=["Translation"])
+async def create_translation(req: TranslationCreateRequest):
+    """
+    J007-C15 : Créer un TranslationRecord lié à une LegalVersion précise.
+
+    Le source_version_hash est calculé automatiquement côté serveur depuis
+    le canonical_content_hash de la LegalVersion source. Cela garantit le
+    lien cryptographique entre la traduction et sa version juridique source.
+
+    Invariant absolu : une traduction ne peut jamais devenir source normative.
+    """
+    logger.debug("[API] POST /v1/translation version=%s %s→%s",
+                 req.version_id, req.source_language, req.target_language)
+    try:
+        tr_id = _db.insert_translation(
+            version_id=req.version_id,
+            source_language=req.source_language,
+            target_language=req.target_language,
+            translated_text=req.translated_text,
+            translation_type=req.translation_type,
+            source_url=req.source_url,
+            translator=req.translator,
+            certainty_level=req.certainty_level,
+            production_type=req.production_type,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail={"error": str(e)})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+    return {
+        "translation_id": tr_id,
+        "status": "created",
+        "source_version_hash_linked": True,
+        "is_normative_source": False,
+        "invariant": "Une traduction est dérivée de sa LegalVersion source — jamais normative",
+    }
+
+
+@app.get("/v1/translation/{translation_id}", tags=["Translation"])
+async def get_translation(translation_id: str):
+    """J007-C15 : Récupérer un TranslationRecord par son ID."""
+    logger.debug("[API] GET /v1/translation/%s", translation_id)
+    t = _db.get_translation(translation_id)
+    if not t:
+        raise HTTPException(status_code=404,
+                            detail=f"TranslationRecord '{translation_id}' non trouvé.")
+    return t
+
+
+@app.get("/v1/translation/version/{version_id}", tags=["Translation"])
+async def get_translations_for_version(version_id: str):
+    """J007-C15 : Lister toutes les traductions d'une version juridique."""
+    logger.debug("[API] GET /v1/translation/version/%s", version_id)
+    translations = _db.get_translations_for_version(version_id)
+    return {
+        "version_id": version_id,
+        "total": len(translations),
+        "translations": translations,
+        "invariant": "Toutes les traductions sont liées à leur version source par source_version_hash",
+    }
+
+
+@app.get("/v1/translation/{translation_id}/integrity", tags=["Translation"])
+async def verify_translation_integrity(translation_id: str):
+    """J007-C15 : Vérifier l'intégrité cryptographique d'un TranslationRecord."""
+    logger.debug("[API] GET /v1/translation/%s/integrity", translation_id)
+    ok, errors = _db.verify_translation_integrity(translation_id)
+    if not ok and errors and "introuvable" in errors[0]:
+        raise HTTPException(status_code=404, detail={"error": errors[0]})
+    return {
+        "translation_id": translation_id,
+        "integrity_ok": ok,
+        "errors": errors,
+    }
